@@ -8,10 +8,9 @@ from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import RobustScaler
 
 from core.data_config import Paths
+from ml.explanation import get_reason_mapper_values
 from ml.infra.blocked_service import InteractionBlocklistService
 from ml.services.user_id import normalize_user_id
-
-np.random.seed(42)
 
 DATA_PATH = Paths.out_data_path / "user_features_all_1000.csv"
 ID_COLUMN = "party_rk"
@@ -20,10 +19,15 @@ TOP_CATEGORY_COLUMN = "top_cat_from_share"
 TOP_CATEGORY_SHARE_COLUMN = "top_cat_share"
 TOP_MCC_COLUMN = "top_mcc_from_share"
 TOP_MCC_SHARE_COLUMN = "top_mcc_share"
+EXOTIC_MIN_CLUSTERS = 4
+EXOTIC_MAX_CLUSTERS = 64
+EXOTIC_CLUSTER_TRAIN_ITERS = 25
+EXOTIC_CLUSTER_REDOS = 3
 
 _SEARCH_LOCK = Lock()
 _SEARCH_BUNDLE = None
 _INTERACTION_BLOCKLIST_SERVICE = InteractionBlocklistService()
+_MAPPER_REASON_VALUES = tuple(get_reason_mapper_values())
 
 
 @dataclass(frozen=True)
@@ -204,6 +208,65 @@ def build_faiss_index(scaled_matrix, config):
     return index
 
 
+def build_cluster_artifacts(scaled_matrix, config=None):
+    user_count = int(scaled_matrix.shape[0])
+    feature_count = int(scaled_matrix.shape[1]) if scaled_matrix.ndim == 2 else 0
+    if user_count == 0 or feature_count == 0:
+        empty_assignments = np.asarray([], dtype=np.int32)
+        return {
+            "cluster_count": 0,
+            "cluster_assignments": empty_assignments,
+            "cluster_member_indices": {},
+            "cluster_order": empty_assignments,
+            "cluster_centroids": np.empty((0, feature_count), dtype=np.float32),
+        }
+
+    cluster_count = _resolve_cluster_count(user_count=user_count, config=config)
+    if cluster_count <= 1:
+        member_indices = np.arange(user_count, dtype=np.int32)
+        return {
+            "cluster_count": 1,
+            "cluster_assignments": np.zeros(user_count, dtype=np.int32),
+            "cluster_member_indices": {0: member_indices},
+            "cluster_order": np.asarray([0], dtype=np.int32),
+            "cluster_centroids": np.mean(scaled_matrix, axis=0, keepdims=True).astype(np.float32),
+        }
+
+    train_matrix = np.ascontiguousarray(scaled_matrix)
+    kmeans = faiss.Kmeans(
+        feature_count,
+        cluster_count,
+        niter=EXOTIC_CLUSTER_TRAIN_ITERS,
+        nredo=EXOTIC_CLUSTER_REDOS,
+        seed=42,
+        verbose=False,
+    )
+    kmeans.train(train_matrix)
+
+    distances_to_centroid, assignments = kmeans.index.search(train_matrix, 1)
+    distances_to_centroid = distances_to_centroid.reshape(-1)
+    cluster_assignments = assignments.reshape(-1).astype(np.int32)
+
+    cluster_member_indices = {}
+    for cluster_id in range(cluster_count):
+        member_indices = np.flatnonzero(cluster_assignments == cluster_id).astype(np.int32)
+        if member_indices.size == 0:
+            continue
+        member_order = np.argsort(distances_to_centroid[member_indices], kind="stable")
+        cluster_member_indices[int(cluster_id)] = member_indices[member_order]
+
+    cluster_order = np.asarray(sorted(cluster_member_indices), dtype=np.int32)
+    cluster_centroids = np.asarray(kmeans.centroids, dtype=np.float32).reshape(cluster_count, feature_count)
+
+    return {
+        "cluster_count": int(cluster_order.size),
+        "cluster_assignments": cluster_assignments,
+        "cluster_member_indices": cluster_member_indices,
+        "cluster_order": cluster_order,
+        "cluster_centroids": cluster_centroids,
+    }
+
+
 def _to_candidate_config(config_like=None):
     if isinstance(config_like, CandidateConfig):
         return config_like
@@ -218,6 +281,18 @@ def _to_candidate_config(config_like=None):
             getattr(config_like, "an_impactful_features", CandidateConfig.an_impactful_features)
         ),
     )
+
+
+def _resolve_cluster_count(user_count, config=None):
+    requested_cluster_count = int(getattr(config, "n_exotic_clusters", 0) or 0)
+    if requested_cluster_count > 0:
+        return max(1, min(user_count, requested_cluster_count))
+
+    heuristic_cluster_count = int(np.sqrt(max(user_count, 1)))
+    bounded_cluster_count = max(EXOTIC_MIN_CLUSTERS, heuristic_cluster_count)
+    bounded_cluster_count = min(EXOTIC_MAX_CLUSTERS, bounded_cluster_count)
+    bounded_cluster_count = min(bounded_cluster_count, max(1, user_count // 40))
+    return max(1, min(user_count, bounded_cluster_count))
 
 
 def _resolve_user_id(user_or_conf):
@@ -248,6 +323,7 @@ def _get_search_bundle(search_bundle=None, config=None):
                 search_bundle["scaled_matrix"],
                 config or CandidateConfig(),
             )
+        _ensure_cluster_artifacts(search_bundle, config=config or CandidateConfig())
         return search_bundle
 
     global _SEARCH_BUNDLE
@@ -262,15 +338,36 @@ def _get_search_bundle(search_bundle=None, config=None):
                 bundle["scaled_matrix"],
                 config or CandidateConfig(),
             )
+            bundle.update(build_cluster_artifacts(bundle["scaled_matrix"], config=config or CandidateConfig()))
             _SEARCH_BUNDLE = bundle
 
     return _SEARCH_BUNDLE
 
 
 def warmup_search_bundle(config=None):
-    """Build and cache search artifacts + FAISS index once per process."""
+    """Build and cache search artifacts, HNSW index and cluster artifacts once per process."""
     effective_config = _to_candidate_config(config)
     return _get_search_bundle(search_bundle=None, config=effective_config)
+
+
+def _ensure_cluster_artifacts(search_bundle, config=None):
+    required_keys = {
+        "cluster_count",
+        "cluster_assignments",
+        "cluster_member_indices",
+        "cluster_order",
+        "cluster_centroids",
+    }
+    if required_keys.issubset(search_bundle):
+        return search_bundle
+
+    search_bundle.update(
+        build_cluster_artifacts(
+            search_bundle["scaled_matrix"],
+            config=config or CandidateConfig(),
+        )
+    )
+    return search_bundle
 
 
 def _extract_impactful_features(query_vector, candidate_vector, feature_names, top_k):
@@ -291,8 +388,6 @@ def _extract_impactful_features(query_vector, candidate_vector, feature_names, t
     ]
     if not top_feature_names:
         return {}
-
-    # Temporary placeholder for impact scoring until business formula is defined.
     random_impacts = np.random.uniform(0.4, 0.95, size=len(top_feature_names))
     return {
         feature_name: round(float(impact), 4)
@@ -303,16 +398,16 @@ def _extract_impactful_features(query_vector, candidate_vector, feature_names, t
 def _extract_random_impactful_features(feature_names, top_k):
     if top_k <= 0:
         return {}
-    if feature_names is None or len(feature_names) == 0:
+    if not _MAPPER_REASON_VALUES:
         return {}
 
-    sample_size = min(int(top_k), len(feature_names))
-    sampled_indices = np.random.choice(len(feature_names), size=sample_size, replace=False)
-    random_impacts = np.random.uniform(0.4, 0.95, size=sample_size)
+    sample_size = min(int(top_k), len(_MAPPER_REASON_VALUES))
+    sampled_reasons = np.random.choice(_MAPPER_REASON_VALUES, size=sample_size, replace=False)
+    random_impacts = np.random.uniform(0.2, 0.9, size=sample_size)
 
     return {
-        str(feature_names[index]): round(float(impact), 4)
-        for index, impact in zip(sampled_indices, random_impacts)
+        str(reason_code): round(float(impact), 4)
+        for reason_code, impact in zip(sampled_reasons, random_impacts)
     }
 
 
@@ -436,7 +531,6 @@ def _filter_blocked_candidates(actor_user_id, candidate_indices, exact_distances
             candidate_user_ids=candidate_user_ids,
         )
     except Exception:
-        # Recommendation serving should continue even if blocklist storage is unavailable.
         return ranked_indices, ranked_distances
     if not blocked_candidate_ids:
         return ranked_indices, ranked_distances

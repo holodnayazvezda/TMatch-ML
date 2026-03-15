@@ -6,7 +6,7 @@ from copy import deepcopy
 from datetime import datetime
 from threading import Lock
 from typing import Any
-from ml.services.interaction_feature_store import process_interaction_batch
+
 from ml.services.user_id import normalize_user_id
 
 SUPPORTED_INTERACTION_ACTIONS = {
