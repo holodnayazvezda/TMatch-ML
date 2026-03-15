@@ -1,0 +1,31 @@
+[project]
+name = "ml"
+version = "0.1.0"
+description = "ML reranker service"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "structlog>=25.0.0",
+    "pydantic-settings>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "numpy>=1.26.0",
+    "pandas>=2.2.0",
+    "scikit-learn>=1.5.0",
+    "faiss-cpu>=1.8.0",
+    "sqlalchemy>=2.0.36",
+    "psycopg[binary]>=3.2.3",
+]
+
+[project.scripts]
+api = "ml.presentation.main:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ml"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/ml", "src/core"]

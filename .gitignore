@@ -1,0 +1,13 @@
+*.csv
+**/__pycache__/
+*.pyc
+*.pyo
+venv/
+env/
+*.parquet
+/data_out/intermediate
+back/
+**/.DS_Store/
+generate_interactions.py
+*.jsonl
+.DS_Store/
