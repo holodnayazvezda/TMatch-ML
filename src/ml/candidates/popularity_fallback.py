@@ -1,4 +1,4 @@
-from src.core.interactions_table import InteractionMatrix
+from core.interactions_table import InteractionMatrix
 
 def get_popular_candidates(conf):
     interaction_matrix = InteractionMatrix()

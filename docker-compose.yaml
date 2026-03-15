@@ -1,21 +1,21 @@
 services:
-
   ml:
     build: .
+    restart: unless-stopped
     ports:
-      - "${SERVER_PORT:-8080}:8080"
+      - "${SERVER_PORT:-8080}:${SERVER_PORT:-8080}"
     env_file:
       - .env
-    environment:
-      SERVER_PORT: "8080"
-      SERVER_HOST: "0.0.0.0"
-      WARMUP_FAISS_ON_STARTUP: "true"
     volumes:
       - ./data:/app/data
       - ./data_out:/app/data_out
-    restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      test: [
+        "CMD",
+        "python",
+        "-c",
+        "import urllib.request; urllib.request.urlopen('http://localhost:${SERVER_PORT:-8080}/health')",
+      ]
       interval: 20s
       timeout: 30s
       start_period: 180s

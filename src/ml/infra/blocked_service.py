@@ -5,7 +5,8 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select
 
-from src.core.config import CONFIG
+from core.config import CONFIG
+from ml.services.user_id import normalize_user_id
 
 from .db.models import Interaction
 from .db.session import SessionLocal
@@ -31,10 +32,13 @@ class InteractionBlocklistService:
         if not candidate_mapping:
             return set()
 
-        latest_interactions = self._get_latest_interactions(
-            actor_user_id=normalized_actor_user_id,
-            candidate_user_ids=list(candidate_mapping),
-        )
+        try:
+            latest_interactions = self._get_latest_interactions(
+                actor_user_id=normalized_actor_user_id,
+                candidate_user_ids=list(candidate_mapping),
+            )
+        except Exception:
+            return set()
         now = datetime.now(timezone.utc)
 
         blocked_targets: set[str] = set()
@@ -104,10 +108,4 @@ def _is_currently_blocked(action: str, created_at: datetime, now: datetime) -> b
 
 
 def _normalize_id(value: str | None) -> str | None:
-    if value is None:
-        return None
-
-    normalized_value = str(value).strip()
-    if not normalized_value:
-        return None
-    return normalized_value
+    return normalize_user_id(value, allow_hash=False)

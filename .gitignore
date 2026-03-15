@@ -9,5 +9,11 @@ env/
 back/
 **/.DS_Store/
 generate_interactions.py
-*.jsonl
+/data_in/synth
+*.ipynb
+/utils
 .DS_Store/
+.DS_Store/
+/data_out/*
+!/data_out/user_features_all_1000.csv
+synthetic_interactions_run

@@ -11,6 +11,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "numpy>=1.26.0",
     "pandas>=2.2.0",
+    "polars>=1.39.0",
     "scikit-learn>=1.5.0",
     "faiss-cpu>=1.8.0",
     "sqlalchemy>=2.0.36",

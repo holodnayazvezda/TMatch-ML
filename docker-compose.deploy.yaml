@@ -1,0 +1,20 @@
+services:
+  ml:
+    image: ${ML_IMAGE:-ml:latest}
+    restart: always
+    ports:
+      - "${ML_PORT:-8080}:${SERVER_PORT:-8080}"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./data_out:/app/data_out
+    networks:
+      shared:
+        aliases:
+          - ml-internal
+
+networks:
+  shared:
+    name: app_shared_net
+    external: true

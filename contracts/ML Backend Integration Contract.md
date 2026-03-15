@@ -31,34 +31,40 @@
 
 ```json
 {
-  "user_id": "string"
+  "user_id": "550e8400-e29b-41d4-a716-446655440000"
 }
 ```
 
 Поля:
-1. `user_id`: `string`, обязательное, непустое.
+1. `user_id`: `string(uuid)`, обязательное, непустое.
 
 ### 2.3 `RecommendationItem`
 
 ```json
 {
   "ml_recommendation_id": "01JXYZ...",
-  "user_id": "string",
-  "candidate_user_id": "string",
+  "user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "candidate_user_id": "2f4f69af-54a5-4f5f-8158-4fa95a57ffde",
   "reasons": {
-    "feature_name": 0.87,
-    "another_feature": 0.41
+    "Общая активность": 0.87,
+    "Разнообразие категорий": 0.41
   }
 }
 ```
 
 Поля:
 1. `ml_recommendation_id`: `string` (ULID, генерируется ML сервисом).
-2. `user_id`: `string` (входной пользователь, для кого сгенерирована рекомендация).
-3. `candidate_user_id`: `string` (рекомендуемый кандидат).
-4. `reasons`: `object<string, number>` (feature -> impact score).
+2. `user_id`: `string(uuid)` (входной пользователь, для кого сгенерирована рекомендация).
+3. `candidate_user_id`: `string(uuid)` (рекомендуемый кандидат).
+4. `reasons`: `object<string, number>` (label -> impact score), где ключи берутся из `FEATURE_REASON_MAPPER[*].label`.
 
-### 2.4 `AuditEvent` (вход для батч-ингеста)
+### 2.4 `RecommendationReasonLabel`
+
+Ключи в `reasons`:
+1. человекочитаемые `label` из словаря объяснений (`src/ml/explanation.py`).
+2. при совпадении нескольких feature в один label используется максимальный impact.
+
+### 2.5 `AuditEvent` (вход для батч-ингеста)
 
 ```json
 {
@@ -66,8 +72,8 @@
   "created_at": "2026-03-15T07:20:00Z",
   "deleted_at": null,
   "event_type": "interaction.created",
-  "actor_user_id": "string",
-  "target_user_id": "string",
+  "actor_user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "target_user_id": "2f4f69af-54a5-4f5f-8158-4fa95a57ffde",
   "payload": {
     "action": "block"
   },
@@ -80,12 +86,12 @@
 2. `created_at`: `string(datetime) | datetime`, для `block` используется как timestamp события.
 3. `deleted_at`: `string(datetime) | null`.
 4. `event_type`: `string`.
-5. `actor_user_id`: `string | null`.
-6. `target_user_id`: `string | null`.
+5. `actor_user_id`: `string(uuid) | null`.
+6. `target_user_id`: `string(uuid) | null`.
 7. `payload`: `object | null`, action читается из `payload.action`.
 8. `sent_to_ml`: `boolean`.
 
-### 2.5 `InteractionsBatchSummary`
+### 2.6 `InteractionsBatchSummary`
 
 ```json
 {
@@ -134,18 +140,17 @@ Response `200`: `array[RecommendationItem]`.
 [
   {
     "ml_recommendation_id": "01JP9QV7JPKK44VX6ZVE8FJ7EM",
-    "user_id": "5f9c4ab0...",
-    "candidate_user_id": "8348b2f3...",
+    "user_id": "550e8400-e29b-41d4-a716-446655440000",
+    "candidate_user_id": "2f4f69af-54a5-4f5f-8158-4fa95a57ffde",
     "reasons": {
-      "trx_cosine_similarity": 0.91,
-      "same_region": 0.52
+      "Общая активность": 0.91
     }
   }
 ]
 ```
 
 Ошибки:
-1. `400 Bad Request` — бизнес-ошибка при обработке рекомендаций.
+1. `400 Bad Request` — бизнес-ошибка при обработке рекомендаций, включая невалидный `user_id` (не UUID).
    Формат:
    ```json
    { "detail": "..." }
@@ -160,7 +165,7 @@ Response `200`: `array[RecommendationItem]`.
 Примечания:
 1. `ml_recommendation_id` генерируется на каждую строку рекомендации.
 2. Дополнительно выполняется внутреннее сохранение `recommendation_id -> source_row` (in-memory stub).
-3. `reasons` всегда объект (`feature -> impact`), даже если в источнике список.
+3. `reasons` всегда объект (`label -> impact`), где `label` берется из explanation mapper.
 4. ML runtime-конфиг (режим реранка, top_n, ratios, candidate limits и т.д.) фиксируется внутри сервиса и не входит в API контракт с backend.
 
 ## 3.3 `POST /interactions/batch`
@@ -175,8 +180,9 @@ Request body: `array[AuditEvent]`.
 3. `action` берется из `payload.action`, нормализуется (`trim + lowercase`), алиас `ublock -> unblock`.
 4. Поддерживаемые action: `block`, `skip`, `unblock`.
 5. Обязательны `actor_user_id`, `target_user_id`; self-interaction (`actor == target`) не допускается.
-6. Для `block` timestamp берется из `AuditEvent.created_at`.
-7. После валидации выполняется только группировка по `actor_user_id` и вызов фиктивной функции инкрементального апдейта фичей пользователя.
+6. `actor_user_id` и `target_user_id` должны быть UUID-строками; не-UUID события считаются `invalid_rows_count`.
+7. Для `block` timestamp берется из `AuditEvent.created_at`.
+8. После валидации выполняется только группировка по `actor_user_id` и вызов фиктивной функции инкрементального апдейта фичей пользователя.
 
 Response `200`: `InteractionsBatchSummary`.
 
@@ -192,8 +198,8 @@ Response `200`: `InteractionsBatchSummary`.
     "created_at": "2026-03-15T07:20:00Z",
     "deleted_at": null,
     "event_type": "interaction.created",
-    "actor_user_id": "user-a",
-    "target_user_id": "user-b",
+    "actor_user_id": "550e8400-e29b-41d4-a716-446655440000",
+    "target_user_id": "2f4f69af-54a5-4f5f-8158-4fa95a57ffde",
     "payload": { "action": "block" },
     "sent_to_ml": false
   },
@@ -202,8 +208,8 @@ Response `200`: `InteractionsBatchSummary`.
     "created_at": "2026-03-15T07:21:00Z",
     "deleted_at": null,
     "event_type": "interaction.created",
-    "actor_user_id": "user-a",
-    "target_user_id": "user-c",
+    "actor_user_id": "550e8400-e29b-41d4-a716-446655440000",
+    "target_user_id": "c2e2f68d-2fc8-4f68-a2f1-2c8356079915",
     "payload": { "action": "ublock" },
     "sent_to_ml": false
   }
@@ -228,7 +234,7 @@ curl -sS http://localhost:8080/health
 ```bash
 curl -sS -X POST http://localhost:8080/recommendation \
   -H "Content-Type: application/json" \
-  -d '{"user_id":"5f9c4ab08cac7457e9111a30e4664920607ea2c115a1433d7be98e97e64244ca"}'
+  -d '{"user_id":"550e8400-e29b-41d4-a716-446655440000"}'
 ```
 
 `interactions/batch`:
@@ -241,8 +247,8 @@ curl -sS -X POST http://localhost:8080/interactions/batch \
       "created_at":"2026-03-15T07:20:00Z",
       "deleted_at":null,
       "event_type":"interaction.created",
-      "actor_user_id":"user-a",
-      "target_user_id":"user-b",
+      "actor_user_id":"550e8400-e29b-41d4-a716-446655440000",
+      "target_user_id":"2f4f69af-54a5-4f5f-8158-4fa95a57ffde",
       "payload":{"action":"skip"},
       "sent_to_ml":false
     }

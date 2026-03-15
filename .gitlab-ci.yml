@@ -2,11 +2,56 @@
 # NOTE: You should not delete this file!
 
 stages:
-  - build
   - test
+  - build
   - deploy
 
 test:
   stage: test
   script:
     - echo 'ok'
+
+build_and_push:
+  stage: build
+  image: docker:24.0.5
+  services:
+    - name: docker:24.0.5-dind
+      command: ["--tls=false"]
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_HOST: tcp://docker:2375
+  script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - IMAGE_NAME="$CI_REGISTRY_IMAGE/ml"
+    - docker build -t "$IMAGE_NAME:latest" -t "$IMAGE_NAME:$CI_COMMIT_SHORT_SHA" .
+    - docker push "$IMAGE_NAME:latest"
+    - docker push "$IMAGE_NAME:$CI_COMMIT_SHORT_SHA"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+deploy:
+  stage: deploy
+  image: alpine:3.20
+  variables:
+    GIT_STRATEGY: none
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval "$(ssh-agent -s)"
+    - chmod 600 "$DEPLOY_SSH_KEY"
+    - ssh-add "$DEPLOY_SSH_KEY"
+    - mkdir -p ~/.ssh
+    - ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+  script:
+    - >
+      ssh "$DEPLOY_USER@$DEPLOY_HOST"
+      "cd /home/ubuntu/ml &&
+       git pull &&
+       docker login -u \"$CI_REGISTRY_USER\" -p \"$CI_REGISTRY_PASSWORD\" \"$CI_REGISTRY\" &&
+       docker network inspect app_shared_net >/dev/null 2>&1 || docker network create app_shared_net &&
+       ML_IMAGE=\"$CI_REGISTRY_IMAGE/ml:latest\" docker compose -f docker-compose.deploy.yaml pull &&
+       ML_IMAGE=\"$CI_REGISTRY_IMAGE/ml:latest\" docker compose -f docker-compose.deploy.yaml down &&
+       ML_IMAGE=\"$CI_REGISTRY_IMAGE/ml:latest\" docker compose -f docker-compose.deploy.yaml up -d"
+  needs:
+    - build_and_push
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'

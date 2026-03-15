@@ -3,6 +3,8 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 import pandas as pd
 
+from ml.services.user_id import normalize_user_id
+
 
 class InteractionMatrix:
     def __init__(self):
@@ -31,8 +33,10 @@ class InteractionMatrix:
             self.last_update = now
 
     def _process_event(self, event: dict):
-        actor = event['actor_user_id']
-        target = event['target_user_id']
+        actor = normalize_user_id(event.get('actor_user_id'), allow_hash=True)
+        target = normalize_user_id(event.get('target_user_id'), allow_hash=True)
+        if actor is None or target is None or actor == target:
+            return
         action = event['payload']['action'] if 'action' in event['payload'] else None
         score = event['payload'].get('score', 0)
 

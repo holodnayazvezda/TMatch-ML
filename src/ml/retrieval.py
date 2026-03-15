@@ -10,6 +10,7 @@ import pandas as pd
 from core.config import GlobalConfig
 from core.data_config import Paths
 from ml.ml_config import RerankConfig
+from ml.services.user_id import normalize_user_id
 
 
 QUERY_ID_COLUMN = "query_user_id"
@@ -165,7 +166,11 @@ def _prepare_source_frame(
         raise ValueError(f"Cannot infer candidate id column for source '{source_name}'.")
 
     source_df = source_df.copy()
-    source_df[CANDIDATE_ID_COLUMN] = source_df[candidate_id_col].astype("string")
+    source_df[CANDIDATE_ID_COLUMN] = (
+        source_df[candidate_id_col]
+        .map(lambda raw_id: normalize_user_id(raw_id, allow_hash=True))
+        .astype("string")
+    )
 
     source_query_column = _pick_first_existing_column(
         source_df,
@@ -173,11 +178,20 @@ def _prepare_source_frame(
     )
     query_from_conf = getattr(conf, "user_id", None)
     if source_query_column is not None:
-        source_df[QUERY_ID_COLUMN] = source_df[source_query_column].astype("string")
+        source_df[QUERY_ID_COLUMN] = (
+            source_df[source_query_column]
+            .map(lambda raw_id: normalize_user_id(raw_id, allow_hash=True))
+            .astype("string")
+        )
     elif query_from_conf is not None:
-        source_df[QUERY_ID_COLUMN] = str(query_from_conf)
+        normalized_query_user_id = normalize_user_id(query_from_conf, allow_hash=True)
+        source_df[QUERY_ID_COLUMN] = normalized_query_user_id
     else:
         raise ValueError(f"Cannot infer query user id for source '{source_name}'. Pass conf.user_id.")
+
+    source_df = source_df[
+        source_df[CANDIDATE_ID_COLUMN].notna() & source_df[QUERY_ID_COLUMN].notna()
+    ].copy()
 
     source_rank_column = _pick_first_existing_column(source_df, ["rank", "source_rank", "position"])
     if source_rank_column is not None:

@@ -1,14 +1,10 @@
-from pathlib import Path
 import re
+from pathlib import Path
 
-import sys
-import os
-
-# Добавляем корневую директорию проекта в путь поиска модулей
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
 import polars as pl
 
-from src.core.data_config import Paths
+from core.data_config import Paths
+from ml.services.user_id import normalize_user_id
 
 PATHS = Paths()
 
@@ -87,6 +83,10 @@ def sanitize_token(value: str) -> str:
     value = re.sub(r"[^\w]+", "_", value, flags=re.UNICODE)
     value = re.sub(r"_+", "_", value).strip("_")
     return value or "unknown"
+
+
+def normalize_party_rk(value: str | None) -> str | None:
+    return normalize_user_id(value, allow_hash=True)
 
 
 def build_unique_feature_name_map(values: list, prefix: str) -> dict:
@@ -169,12 +169,15 @@ def build_tx_layer(csv_files: list[Path]) -> None:
 
     prepared_lf = raw_lf.select(EXPECTED_COLUMNS).with_columns(
         pl.col("real_transaction_dttm").str.strptime(pl.Datetime, format=DT_FORMAT, strict=False),
-        pl.col("party_rk").cast(pl.Utf8),
+        pl.col("party_rk")
+        .cast(pl.Utf8)
+        .map_elements(normalize_party_rk, return_dtype=pl.Utf8)
+        .alias("party_rk"),
         pl.col("transaction_rk").cast(pl.Utf8),
         pl.coalesce([pl.col("merchant_nm").cast(pl.Utf8), pl.lit("unknown_merchant")]).alias("merchant_nm"),
         pl.coalesce([pl.col("category_nm").cast(pl.Utf8), pl.lit("unknown")]).alias("category_nm"),
         pl.col("merchant_type_code").cast(pl.Int32, strict=False).fill_null(-1).alias("merchant_type_code"),
-    )
+    ).filter(pl.col("party_rk").is_not_null())
 
     if DEDUPLICATE_BY_TRANSACTION_ID:
         prepared_lf = prepared_lf.unique(subset=["transaction_rk"], keep="any")
