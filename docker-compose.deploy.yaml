@@ -6,6 +6,8 @@ services:
       - "${ML_PORT:-8080}:${SERVER_PORT:-8080}"
     env_file:
       - .env
+    environment:
+      ROOT_PATH: ${ROOT_PATH:-/ml}
     volumes:
       - ./data:/app/data
       - ./data_out:/app/data_out

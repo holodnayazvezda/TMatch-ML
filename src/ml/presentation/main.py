@@ -18,7 +18,11 @@ log: structlog.BoundLogger = structlog.get_logger(__name__)
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="ML", version="0.1.0")
+    app = FastAPI(
+        title="ML",
+        version="0.1.0",
+        root_path=settings.root_path,
+    )
     app.include_router(health_router)
     app.include_router(interactions_router)
     app.include_router(recommendation_router)

@@ -6,6 +6,7 @@ class Settings(BaseSettings):
 
     server_host: str = "0.0.0.0"
     server_port: int = 8080
+    root_path: str = ""
     warmup_faiss_on_startup: bool = True
 
 
