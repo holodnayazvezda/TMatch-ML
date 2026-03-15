@@ -27,7 +27,7 @@ build_and_push:
     - docker push "$IMAGE_NAME:latest"
     - docker push "$IMAGE_NAME:$CI_COMMIT_SHORT_SHA"
   rules:
-    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH == "master"'
 
 deploy:
   stage: deploy
@@ -52,6 +52,7 @@ deploy:
        ML_IMAGE=\"$CI_REGISTRY_IMAGE/ml:latest\" docker compose -f docker-compose.deploy.yaml down &&
        ML_IMAGE=\"$CI_REGISTRY_IMAGE/ml:latest\" docker compose -f docker-compose.deploy.yaml up -d"
   needs:
-    - build_and_push
+    - job: build_and_push
+      optional: true
   rules:
-    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH == "master"'
