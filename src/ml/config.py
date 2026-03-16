@@ -8,8 +8,6 @@ class Settings(BaseSettings):
     server_port: int = 8080
     root_path: str = ""
     warmup_faiss_on_startup: bool = True
-    interaction_poll_interval_seconds: float = 0.5
-    interaction_poll_batch_size: int = 500
 
 
 settings = Settings()

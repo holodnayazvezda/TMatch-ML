@@ -51,25 +51,9 @@ def get_exotic_candidates(request_or_n_people, search_bundle=None):
         return pd.DataFrame()
 
     result_df = output_df.iloc[selected_indices].copy().reset_index(drop=True)
-    impactful_feature_count = int(
-        getattr(
-            request_or_n_people,
-            "an_impactful_features",
-            transactions_candidates.CandidateConfig.an_impactful_features,
-        )
-        or 0
-    )
-    impactful_features = [
-        transactions_candidates._extract_seeded_impactful_features(
-            seed_value=f"{actor_user_id or 'anonymous'}:{str(user_ids[int(candidate_index)])}:exotic",
-            top_k=impactful_feature_count,
-        )
-        for candidate_index in selected_indices
-    ]
     result_df.insert(0, "rank", np.arange(1, len(result_df) + 1, dtype=np.int32))
     result_df.insert(1, "cluster_id", np.asarray(selected_cluster_ids, dtype=np.int32))
     result_df.insert(2, "distance_euclidean", np.asarray(centroid_distances, dtype=float))
-    result_df.insert(3, "impactful_features", impactful_features)
     return result_df
  
 def _resolve_exotic_request(request_or_n_people):

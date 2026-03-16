@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from dataclasses import replace
 from pathlib import Path
 
@@ -10,16 +8,10 @@ from joblib import load as joblib_load
 from core.config import GlobalConfig
 from core.data_config import Paths
 from ml.ml_config import RerankConfig
-from ml.services.recommendation_scoring import (
-    DEFAULT_SCORE_WEIGHTS,
-    PREDICTION_COLUMN_BY_TARGET,
-    PROBABILITY_TARGETS,
-    compute_linear_score_frame,
-)
 from ml.services.user_id import normalize_user_id
 
 
-def rerank(conf: RerankConfig, g_conf: GlobalConfig) -> pd.DataFrame:
+def rerank(conf: RerankConfig, g_conf: GlobalConfig):
     rerank_mode = int(getattr(conf, "rerank_mode", 0) or 0)
 
     if rerank_mode == 0:
@@ -35,168 +27,96 @@ def rerank(conf: RerankConfig, g_conf: GlobalConfig) -> pd.DataFrame:
 
 
 def load_or_fallback_1(conf: RerankConfig, g_conf: GlobalConfig) -> pd.DataFrame:
-    return _rerank_with_probability_models(conf=conf, g_conf=g_conf, target_mode=1)
+    fallback_df = get_mode0_recommendations(conf=conf, g_conf=g_conf)
+    model = _load_model_for_mode(conf=conf, mode=1)
+    if model is None:
+        return fallback_df
+    return _apply_model_or_fallback(
+        model=model,
+        base_df=fallback_df,
+        fallback_df=fallback_df,
+        conf=conf,
+        g_conf=g_conf,
+        mode=1,
+    )
 
 
 def load_or_fallback_2(conf: RerankConfig, g_conf: GlobalConfig) -> pd.DataFrame:
-    return _rerank_with_probability_models(conf=conf, g_conf=g_conf, target_mode=2)
+    fallback_df = load_or_fallback_1(conf=conf, g_conf=g_conf)
+    model = _load_model_for_mode(conf=conf, mode=2)
+    if model is None:
+        return fallback_df
+    return _apply_model_or_fallback(
+        model=model,
+        base_df=fallback_df,
+        fallback_df=fallback_df,
+        conf=conf,
+        g_conf=g_conf,
+        mode=2,
+    )
 
 
 def load_or_fallback_3(conf: RerankConfig, g_conf: GlobalConfig) -> pd.DataFrame:
-    return _rerank_with_probability_models(conf=conf, g_conf=g_conf, target_mode=3)
+    fallback_df = load_or_fallback_2(conf=conf, g_conf=g_conf)
+    model = _load_model_for_mode(conf=conf, mode=3)
+    if model is None:
+        return fallback_df
+    return _apply_model_or_fallback(
+        model=model,
+        base_df=fallback_df,
+        fallback_df=fallback_df,
+        conf=conf,
+        g_conf=g_conf,
+        mode=3,
+    )
 
 
-def _rerank_with_probability_models(
+def _apply_model_or_fallback(
+    model,
+    base_df: pd.DataFrame,
+    fallback_df: pd.DataFrame,
     conf: RerankConfig,
     g_conf: GlobalConfig,
-    *,
-    target_mode: int,
+    mode: int,
 ) -> pd.DataFrame:
-    base_df = _get_mode0_candidate_pool(conf=conf, g_conf=g_conf)
+    try:
+        return _rerank_with_model(model=model, base_df=base_df, conf=conf, g_conf=g_conf, mode=mode)
+    except Exception:
+        return fallback_df
+
+
+def _rerank_with_model(
+    model,
+    base_df: pd.DataFrame,
+    conf: RerankConfig,
+    g_conf: GlobalConfig,
+    mode: int,
+) -> pd.DataFrame:
     if base_df.empty:
-        return _ensure_probability_columns(base_df.copy())
+        return base_df
 
     n_rec_users = int(getattr(g_conf, "n_rec_users", 0) or 0)
     if n_rec_users <= 0:
         return pd.DataFrame()
 
     feature_matrix = _build_model_matrix(base_df)
+    feature_matrix = _align_model_matrix(feature_matrix, model)
+    scores = _predict_scores(model=model, feature_matrix=feature_matrix)
+    if scores.shape[0] != base_df.shape[0]:
+        raise ValueError("Model produced unexpected score vector length.")
+
+    score_col = f"rerank_mode_{mode}_score"
     scored_df = base_df.copy()
+    scored_df[score_col] = scores
 
-    cache: dict[tuple[int, str], np.ndarray | None] = {}
-    has_any_prediction = False
+    sort_cols = [score_col]
+    sort_asc = [False]
+    if "rank" in scored_df.columns:
+        sort_cols.append("rank")
+        sort_asc.append(True)
 
-    for target in PROBABILITY_TARGETS:
-        prediction = _predict_target_with_fallback(
-            conf=conf,
-            mode=target_mode,
-            target=target,
-            feature_matrix=feature_matrix,
-            row_count=scored_df.shape[0],
-            cache=cache,
-        )
-        target_column = PREDICTION_COLUMN_BY_TARGET[target]
-        if prediction is None:
-            scored_df[target_column] = np.nan
-            continue
-
-        scored_df[target_column] = prediction
-        has_any_prediction = True
-
-    if has_any_prediction:
-        scored_df["rerank_score"] = compute_linear_score_frame(
-            scored_df,
-            weights=DEFAULT_SCORE_WEIGHTS,
-        )
-        sort_columns = ["rerank_score"]
-        sort_order = [False]
-        if "rank" in scored_df.columns:
-            sort_columns.append("rank")
-            sort_order.append(True)
-        scored_df = scored_df.sort_values(sort_columns, ascending=sort_order, na_position="last").reset_index(
-            drop=True
-        )
-    else:
-        scored_df["rerank_score"] = np.nan
-
-    normalized_df = _normalize_and_dedupe_candidates(scored_df, conf=conf)
-    return normalized_df.head(n_rec_users).reset_index(drop=True)
-
-
-def _predict_target_with_fallback(
-    *,
-    conf: RerankConfig,
-    mode: int,
-    target: str,
-    feature_matrix: pd.DataFrame,
-    row_count: int,
-    cache: dict[tuple[int, str], np.ndarray | None],
-) -> np.ndarray | None:
-    cache_key = (mode, target)
-    if cache_key in cache:
-        return cache[cache_key]
-
-    if mode <= 0:
-        cache[cache_key] = None
-        return None
-
-    model = _load_target_model_for_mode(conf=conf, mode=mode, target=target)
-    if model is None:
-        fallback_prediction = _predict_target_with_fallback(
-            conf=conf,
-            mode=mode - 1,
-            target=target,
-            feature_matrix=feature_matrix,
-            row_count=row_count,
-            cache=cache,
-        )
-        cache[cache_key] = fallback_prediction
-        return fallback_prediction
-
-    try:
-        aligned_matrix = _align_model_matrix(feature_matrix, model)
-        prediction = _predict_scores(model=model, feature_matrix=aligned_matrix)
-        if prediction.shape[0] != row_count:
-            raise ValueError("Model produced unexpected score vector length.")
-        cache[cache_key] = prediction
-        return prediction
-    except Exception:
-        fallback_prediction = _predict_target_with_fallback(
-            conf=conf,
-            mode=mode - 1,
-            target=target,
-            feature_matrix=feature_matrix,
-            row_count=row_count,
-            cache=cache,
-        )
-        cache[cache_key] = fallback_prediction
-        return fallback_prediction
-
-
-def _load_target_model_for_mode(conf: RerankConfig, mode: int, target: str):
-    model_path = _resolve_target_model_path(conf=conf, mode=mode, target=target)
-    if model_path is None:
-        return None
-    try:
-        return joblib_load(model_path)
-    except Exception:
-        return None
-
-
-def _resolve_target_model_path(conf: RerankConfig, mode: int, target: str) -> Path | None:
-    explicit_attr = f"rerank_mode_{mode}_{target}_model_path"
-    explicit_value = getattr(conf, explicit_attr, None)
-    if explicit_value:
-        return Path(explicit_value)
-
-    target_path_mapping = getattr(conf, "rerank_target_model_paths", None)
-    if isinstance(target_path_mapping, dict):
-        mode_mapping = target_path_mapping.get(mode)
-        if isinstance(mode_mapping, dict):
-            mode_target_path = mode_mapping.get(target)
-            if mode_target_path:
-                return Path(mode_target_path)
-
-    generic_attr = f"rerank_mode_{mode}_model_path"
-    generic_path = getattr(conf, generic_attr, None)
-    if generic_path:
-        return Path(generic_path)
-
-    generic_path_mapping = getattr(conf, "rerank_model_paths", None)
-    if isinstance(generic_path_mapping, dict):
-        mapped_generic_path = generic_path_mapping.get(mode)
-        if mapped_generic_path:
-            return Path(mapped_generic_path)
-
-    target_default = Paths.out_data_path / f"reranker_mode_{mode}_{target}.joblib"
-    generic_default = Paths.out_data_path / f"reranker_mode_{mode}.joblib"
-
-    if target_default.exists():
-        return target_default
-    if generic_default.exists():
-        return generic_default
-
-    return target_default
+    scored_df = scored_df.sort_values(sort_cols, ascending=sort_asc, na_position="last").reset_index(drop=True)
+    return _take_candidates_in_source_order(scored_df, conf=conf, n_rec_users=n_rec_users)
 
 
 def _build_model_matrix(base_df: pd.DataFrame) -> pd.DataFrame:
@@ -210,15 +130,12 @@ def _build_model_matrix(base_df: pd.DataFrame) -> pd.DataFrame:
         "query_party_rk",
         "request_user_id",
         "impactful_features",
-        "rerank_score",
-        *PREDICTION_COLUMN_BY_TARGET.values(),
     }
 
     feature_parts: dict[str, pd.Series] = {}
     for column in base_df.columns:
         if column in skip_columns:
             continue
-
         series = base_df[column]
         non_null = series.dropna()
         if not non_null.empty and isinstance(non_null.iloc[0], (dict, list, set, tuple)):
@@ -274,61 +191,64 @@ def _predict_scores(model, feature_matrix: pd.DataFrame) -> np.ndarray:
     raise ValueError("Model must implement predict_proba, decision_function, or predict.")
 
 
-def get_mode0_recommendations(conf: RerankConfig, g_conf: GlobalConfig) -> pd.DataFrame:
-    n_rec_users = int(getattr(g_conf, "n_rec_users", 0) or 0)
-    if n_rec_users <= 0:
-        return pd.DataFrame()
-
-    source_candidates = _get_mode0_candidate_pool(conf=conf, g_conf=g_conf)
-    result_df = _take_candidates_in_source_order(source_candidates, conf=conf, n_rec_users=n_rec_users)
-    return _ensure_probability_columns(result_df)
-
-
-def _get_mode0_candidate_pool(conf: RerankConfig, g_conf: GlobalConfig) -> pd.DataFrame:
-    from ml.candidates import exotic_candidates, transactions_candidates
-    from ml.retrieval import collect_retrieval_candidates
-
-    n_rec_users = int(getattr(g_conf, "n_rec_users", 0) or 0)
-    if n_rec_users <= 0:
-        return pd.DataFrame()
-
-    conf_top_n = int(getattr(conf, "top_n", 0) or 0)
-    candidate_pool_size = max(conf_top_n, n_rec_users)
-    effective_conf = replace(conf, top_n=candidate_pool_size)
-
+def _load_model_for_mode(conf: RerankConfig, mode: int):
+    model_path = _resolve_model_path(conf=conf, mode=mode)
+    if model_path is None:
+        return None
     try:
-        retrieval_df = collect_retrieval_candidates(conf=effective_conf, g_conf=g_conf)
+        return joblib_load(model_path)
     except Exception:
-        retrieval_df = pd.DataFrame()
-    if not retrieval_df.empty:
-        return retrieval_df
+        return None
+
+
+def _resolve_model_path(conf: RerankConfig, mode: int) -> Path | None:
+    specific_attr = f"rerank_mode_{mode}_model_path"
+    specific_path = getattr(conf, specific_attr, None)
+    if specific_path:
+        return Path(specific_path)
+
+    model_paths = getattr(conf, "rerank_model_paths", None)
+    if isinstance(model_paths, dict):
+        dynamic_path = model_paths.get(mode)
+        if dynamic_path:
+            return Path(dynamic_path)
+
+    return Paths.out_data_path / f"reranker_mode_{mode}.joblib"
+
+
+def get_mode0_recommendations(conf: RerankConfig, g_conf: GlobalConfig) -> pd.DataFrame:
+    from ml.candidates import exotic_candidates, transactions_candidates
+
+    n_rec_users = int(getattr(g_conf, "n_rec_users", 0) or 0)
+    if n_rec_users <= 0:
+        return pd.DataFrame()
+
+    # Ensure transaction source can return enough rows for final cut.
+    conf_top_n = int(getattr(conf, "top_n", 0) or 0)
+    effective_conf = replace(conf, top_n=max(conf_top_n, n_rec_users))
 
     transactions_df = _safe_fetch_candidates(transactions_candidates.get_transaction_candidates, effective_conf)
     if not transactions_df.empty:
-        return transactions_df
+        return _take_candidates_in_source_order(transactions_df, conf=effective_conf, n_rec_users=n_rec_users)
 
-    return _safe_fetch_candidates(exotic_candidates.get_exotic_candidates, effective_conf)
+    exotic_df = _safe_fetch_candidates(exotic_candidates.get_exotic_candidates, effective_conf)
+    return _take_candidates_in_source_order(exotic_df, conf=effective_conf, n_rec_users=n_rec_users)
 
 
 def _safe_fetch_candidates(fetcher, conf: RerankConfig) -> pd.DataFrame:
     try:
-        data_frame = fetcher(conf)
-    except (FileNotFoundError, KeyError, ValueError):
+        df = fetcher(conf)
+    except (KeyError, ValueError):
         return pd.DataFrame()
 
-    if data_frame is None:
+    if df is None:
         return pd.DataFrame()
-    if not isinstance(data_frame, pd.DataFrame):
+    if not isinstance(df, pd.DataFrame):
         raise TypeError("Candidates fetcher must return pandas.DataFrame or None.")
-    return data_frame
+    return df
 
 
 def _take_candidates_in_source_order(source_df: pd.DataFrame, conf: RerankConfig, n_rec_users: int) -> pd.DataFrame:
-    normalized_df = _normalize_and_dedupe_candidates(source_df, conf=conf)
-    return normalized_df.head(n_rec_users).reset_index(drop=True)
-
-
-def _normalize_and_dedupe_candidates(source_df: pd.DataFrame, conf: RerankConfig) -> pd.DataFrame:
     if source_df.empty:
         return source_df
 
@@ -356,27 +276,14 @@ def _normalize_and_dedupe_candidates(source_df: pd.DataFrame, conf: RerankConfig
     elif getattr(conf, "user_id", None) is not None:
         result["query_user_id"] = normalize_user_id(conf.user_id, allow_hash=True)
 
+    # Keep source-provided ordering; remove duplicates only preserving first appearance.
     if "candidate_id" in result.columns:
         dedupe_keys = ["candidate_id"]
         if "query_user_id" in result.columns:
             dedupe_keys = ["query_user_id", "candidate_id"]
         result = result.drop_duplicates(subset=dedupe_keys, keep="first")
 
-    return result
-
-
-def _ensure_probability_columns(result_df: pd.DataFrame) -> pd.DataFrame:
-    if result_df.empty:
-        return result_df
-
-    for prediction_column in PREDICTION_COLUMN_BY_TARGET.values():
-        if prediction_column not in result_df.columns:
-            result_df[prediction_column] = np.nan
-
-    if "rerank_score" not in result_df.columns:
-        result_df["rerank_score"] = np.nan
-
-    return result_df
+    return result.head(n_rec_users).reset_index(drop=True)
 
 
 def _pick_first_existing_column(df: pd.DataFrame, columns: list[str]) -> str | None:

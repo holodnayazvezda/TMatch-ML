@@ -13,7 +13,7 @@ class GlobalConfig:
 
     postgres_user: str = "postgres"
     postgres_password: str = "postgres"
-    postgres_host: str = "localhost"
+    postgres_host: str = "host.docker.internal"
     postgres_port: int = 5432
     postgres_db: str = "ml_db"
 
@@ -26,7 +26,7 @@ class GlobalConfig:
 CONFIG = GlobalConfig(
     postgres_user=getenv("POSTGRES_USER", "postgres"),
     postgres_password=getenv("POSTGRES_PASSWORD", "postgres"),
-    postgres_host=getenv("POSTGRES_HOST", "localhost"),
+    postgres_host=getenv("POSTGRES_HOST", "host.docker.internal"),
     postgres_port=int(getenv("POSTGRES_PORT", "5432")),
     postgres_db=getenv("POSTGRES_DB", "ml_db"),
 )

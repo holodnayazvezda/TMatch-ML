@@ -3,8 +3,8 @@ from pathlib import Path
 
 import polars as pl
 
-from src.core.data_config import Paths
-from src.ml.services.user_id import normalize_user_id
+from core.data_config import Paths
+from ml.services.user_id import normalize_user_id
 
 PATHS = Paths()
 
@@ -22,9 +22,8 @@ CATEGORY_FEATURES_PATH = FEATURES_DIR / f"category_features_{PIPELINE_VERSION}.p
 MCC_FEATURES_PATH = FEATURES_DIR / f"mcc_features_{PIPELINE_VERSION}.parquet"
 MERCHANT_FEATURES_PATH = FEATURES_DIR / f"merchant_features_{PIPELINE_VERSION}.parquet"
 
-# Canonical transaction feature snapshot for downstream retrieval.
-FINAL_PARQUET_PATH = PATHS.transaction_user_features_parquet_path
-FINAL_CSV_PATH = PATHS.transaction_user_features_csv_path
+FINAL_PARQUET_PATH = ARTIFACTS_DIR / "user_features_all.parquet"
+FINAL_CSV_PATH = ARTIFACTS_DIR / "user_features_all.csv"
 
 EXPECTED_COLUMNS = [
     "real_transaction_dttm",
@@ -131,7 +130,7 @@ def validate_inputs() -> list[Path]:
         raise FileNotFoundError(f"Input data directory not found: {DATA_DIR}")
 
     csv_files = []
-    for i in range(1, 2):
+    for i in range(1, 7):
         folder = DATA_DIR / f"Data_{i}"
         if folder.exists():
             csv_files.extend(sorted(folder.glob("*.csv")))

@@ -1,21 +1,15 @@
-from datetime import datetime, timezone
-
 from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session
 
-from ml.config import settings
+from ml.explanation import map_feature_impacts_to_labels
+from ml.reranker import rerank
 from ml.services.recommendation_identity import generate_recommendation_id
 from ml.services.recommendation_runtime_config import (
     DEFAULT_RECOMMENDATION_RUNTIME_CONFIG,
 )
-from ml.services.recommendation_serving import get_recommendations_for_user
-from ml.services.recommendation_store import (
-    run_with_user_recommendation_lock,
-    save_recommendation_group_in_session,
-)
+from ml.services.recommendation_store import save_recommendation_row
 from ml.services.user_id import normalize_user_id
 
 router = APIRouter(prefix="/recommendation", tags=["recommendation"])
@@ -27,90 +21,60 @@ class RecommendationRequest(BaseModel):
 
 @router.post("")
 async def recommendation(payload: RecommendationRequest) -> JSONResponse:
+    request_user_id = str(payload.user_id).strip()
+    conf, g_conf = DEFAULT_RECOMMENDATION_RUNTIME_CONFIG.build_configs(request_user_id)
+
     try:
-        recommendations = await run_in_threadpool(_generate_recommendations_response, payload.user_id)
+        result_df = await run_in_threadpool(rerank, conf, g_conf)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to process request: {exc}") from exc
 
-    return JSONResponse(status_code=200, content=recommendations)
-
-
-def _generate_recommendations_response(raw_user_id: str) -> list[dict[str, object]]:
-    request_user_id = str(raw_user_id).strip()
-    normalized_user_id = normalize_user_id(request_user_id, allow_hash=True)
-    if normalized_user_id is None:
-        raise ValueError("Invalid user_id.")
-
-    conf, g_conf = DEFAULT_RECOMMENDATION_RUNTIME_CONFIG.build_configs(normalized_user_id)
-    served_stage = DEFAULT_RECOMMENDATION_RUNTIME_CONFIG.recommendation_stage.value
-
-    def _locked_flow(session: Session) -> list[dict[str, object]]:
-        result_df = get_recommendations_for_user(
-            user_id=normalized_user_id,
-            runtime_config=DEFAULT_RECOMMENDATION_RUNTIME_CONFIG,
-            conf=conf,
-            g_conf=g_conf,
+    recommendations = []
+    for row in result_df.to_dict(orient="records"):
+        resolved_user_id = normalize_user_id(
+            _pick_first_not_none(
+                row.get("query_user_id"),
+                row.get("query_party_rk"),
+                row.get("request_user_id"),
+                payload.user_id,
+            ),
+            allow_hash=True,
         )
+        if resolved_user_id is None:
+            continue
+
+        candidate_user_id = _pick_first_not_none(
+            row.get("candidate_id"),
+            row.get("party_rk"),
+            row.get("user_id"),
+            row.get("target_user_id"),
+            row.get("id"),
+        )
+        normalized_candidate_id = normalize_user_id(candidate_user_id, allow_hash=True)
+        if normalized_candidate_id is None:
+            continue
+
+        reasons = map_feature_impacts_to_labels(row.get("impactful_features"))
         recommendation_id = generate_recommendation_id()
-        shown_at = datetime.now(timezone.utc)
+        save_recommendation_row(
+            recommendation_id=recommendation_id,
+            user_id=resolved_user_id,
+            candidate_user_id=normalized_candidate_id,
+            source_row=row,
+        )
 
-        recommendations: list[dict[str, object]] = []
-        recommendation_rows: list[dict[str, object]] = []
-        seen_candidate_ids: set[str] = set()
-        for row in result_df.to_dict(orient="records"):
-            candidate_user_id = _pick_first_not_none(
-                row.get("candidate_id"),
-                row.get("party_rk"),
-                row.get("user_id"),
-                row.get("target_user_id"),
-                row.get("id"),
-            )
-            normalized_candidate_id = normalize_user_id(candidate_user_id, allow_hash=True)
-            if normalized_candidate_id is None:
-                continue
-            if normalized_candidate_id in seen_candidate_ids:
-                continue
-            seen_candidate_ids.add(normalized_candidate_id)
+        recommendations.append(
+            {
+                "ml_recommendation_id": recommendation_id,
+                "user_id": resolved_user_id,
+                "candidate_user_id": normalized_candidate_id,
+                "reasons": reasons,
+            }
+        )
 
-            reasons = row.get("reasons")
-            if not isinstance(reasons, dict) or len(reasons) != 3:
-                continue
-
-            recommendation_rows.append(
-                {
-                    "candidate_user_id": normalized_candidate_id,
-                    "source_row": row,
-                }
-            )
-            recommendations.append(
-                {
-                    "ml_recommendation_id": recommendation_id,
-                    "user_id": normalized_user_id,
-                    "candidate_user_id": normalized_candidate_id,
-                    "reasons": reasons,
-                }
-            )
-
-        if recommendation_rows:
-            with session.begin():
-                save_recommendation_group_in_session(
-                    session,
-                    recommendation_id=recommendation_id,
-                    actor_user_id=normalized_user_id,
-                    recommendation_rows=recommendation_rows,
-                    shown_at=shown_at,
-                    served_stage=served_stage,
-                )
-
-        return recommendations
-
-    return run_with_user_recommendation_lock(
-        normalized_user_id,
-        poll_wait_seconds=float(settings.interaction_poll_interval_seconds),
-        callback=_locked_flow,
-    )
+    return JSONResponse(status_code=200, content=recommendations)
 
 
 def _pick_first_not_none(*values):

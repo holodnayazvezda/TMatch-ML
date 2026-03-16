@@ -6,19 +6,15 @@ from typing import Callable
 
 import numpy as np
 import pandas as pd
-import structlog
 
 from core.config import GlobalConfig
 from core.data_config import Paths
-from ml.infra.blocked_service import InteractionBlocklistService
 from ml.ml_config import RerankConfig
 from ml.services.user_id import normalize_user_id
 
 
 QUERY_ID_COLUMN = "query_user_id"
 CANDIDATE_ID_COLUMN = "candidate_id"
-log: structlog.BoundLogger = structlog.get_logger(__name__)
-_BLOCKLIST_SERVICE = InteractionBlocklistService()
 
 
 def save_candidates_dataset(candidates_df: pd.DataFrame, output_path: str | Path | None = None) -> Path:
@@ -55,7 +51,6 @@ def collect_retrieval_candidates(conf: RerankConfig, g_conf: GlobalConfig) -> pd
         return merged
 
     merged = _add_common_retrieval_features(merged, source_names)
-    merged = _apply_block_filter(merged)
     merged = merged.sort_values(
         ["retrieval_sources_count", "retrieval_best_rank"],
         ascending=[False, True],
@@ -71,27 +66,17 @@ def collect_and_save_retrieval_candidates(conf: RerankConfig, g_conf: GlobalConf
 
 
 def _fetch_source_candidates(conf: RerankConfig) -> dict[str, pd.DataFrame]:
-    from ml.candidates import exotic_candidates, interactions_candidates, popularity_fallback, transactions_candidates
+    from ml.candidates import exotic_candidates, popularity_fallback, transactions_candidates
 
     fetchers: list[tuple[str, Callable[[RerankConfig], pd.DataFrame | None]]] = [
         ("transactions", transactions_candidates.get_transaction_candidates),
         ("exotic", exotic_candidates.get_exotic_candidates),
         ("popularity", popularity_fallback.get_popular_candidates),
-        ("tx_interaction", interactions_candidates.get_interaction_candidates),
     ]
 
     source_frames: dict[str, pd.DataFrame] = {}
     for source_name, fetcher in fetchers:
-        try:
-            source_df = fetcher(conf)
-        except Exception as exc:
-            log.warning(
-                "retrieval_source_fetch_failed",
-                source_name=source_name,
-                error=str(exc),
-            )
-            source_frames[source_name] = pd.DataFrame()
-            continue
+        source_df = fetcher(conf)
         if source_df is None:
             source_frames[source_name] = pd.DataFrame()
             continue
@@ -296,21 +281,6 @@ def _add_common_retrieval_features(merged: pd.DataFrame, source_names: list[str]
     merged["retrieval_primary_source"] = merged[rank_cols].idxmin(axis=1, skipna=True).str.replace(
         "retrieval_", "",
     ).str.replace("_rank", "")
-    merged["query_party_rk"] = merged[QUERY_ID_COLUMN]
-    merged["party_rk"] = merged[CANDIDATE_ID_COLUMN]
-    merged["rank"] = merged["retrieval_best_rank"]
-    merged["distance_euclidean"] = np.nan
-    merged["impactful_features"] = None
-
-    for source_name in source_names:
-        source_mask = merged["retrieval_primary_source"] == source_name
-        source_score_column = f"retrieval_{source_name}_score"
-        source_impactful_column = f"retrieval_{source_name}_feature_impactful_features"
-        if source_score_column in merged.columns:
-            merged.loc[source_mask, "distance_euclidean"] = merged.loc[source_mask, source_score_column]
-        if source_impactful_column in merged.columns:
-            merged.loc[source_mask, "impactful_features"] = merged.loc[source_mask, source_impactful_column]
-
     return merged
 
 
@@ -349,32 +319,3 @@ def _pick_source_score_column(df: pd.DataFrame) -> str | None:
     if not numeric_candidates:
         return None
     return numeric_candidates[0]
-
-
-def _apply_block_filter(merged: pd.DataFrame) -> pd.DataFrame:
-    if merged.empty:
-        return merged
-
-    query_user_id = normalize_user_id(merged[QUERY_ID_COLUMN].dropna().iloc[0], allow_hash=True) if QUERY_ID_COLUMN in merged.columns and not merged[QUERY_ID_COLUMN].dropna().empty else None
-    if query_user_id is None:
-        return merged
-
-    result = merged.copy()
-    result[CANDIDATE_ID_COLUMN] = (
-        result[CANDIDATE_ID_COLUMN]
-        .map(lambda raw_id: normalize_user_id(raw_id, allow_hash=True))
-        .astype("string")
-    )
-    try:
-        blocked_candidate_ids = _BLOCKLIST_SERVICE.get_blocked_targets(
-            actor_user_id=query_user_id,
-            candidate_user_ids=result[CANDIDATE_ID_COLUMN].dropna().astype("string").tolist(),
-        )
-    except Exception:
-        blocked_candidate_ids = set()
-    result = result[
-        result[CANDIDATE_ID_COLUMN].notna()
-        & (result[CANDIDATE_ID_COLUMN] != query_user_id)
-        & (~result[CANDIDATE_ID_COLUMN].isin(blocked_candidate_ids))
-    ].copy()
-    return result.reset_index(drop=True)

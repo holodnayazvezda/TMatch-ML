@@ -1,31 +1,18 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from core.config import GlobalConfig
-from core.data_config import InteractionWeightsMapper, Paths
 from ml.ml_config import RerankConfig
-from ml.services.recommendation_scoring import (
-    DEFAULT_ENSEMBLE_WEIGHTS,
-    EnsembleWeights,
-    RecommendationStage,
-)
 
 
 @dataclass(frozen=True)
 class RecommendationRuntimeConfig:
-    recommendation_stage: RecommendationStage = RecommendationStage.STAGE_1
     rerank_mode: int = 0
-    top_n: int = 150
-    ratios: tuple[float, ...] = (0.25, 0.25, 0.25, 0.25)
-    an_impactful_features: int = 6
+    top_n: int = 100
+    ratios: tuple[float, ...] = (1.0, 0.0, 0.0)
+    an_impactful_features: int = 3
     n_max_candidates: int | None = 300
     n_min_candidates: int | None = 100
     n_rec_users: int = 5
-    ensemble_weights: EnsembleWeights = DEFAULT_ENSEMBLE_WEIGHTS
-    popularity_action_weights: dict[str, float] = field(
-        default_factory=lambda: dict(InteractionWeightsMapper().dict_to_map)
-    )
-    stage_23_model_dir: str = str(Paths.stage_23_model_dir)
-    stage_4_model_dir: str = str(Paths.stage_4_model_dir)
 
     def build_configs(self, user_id: str) -> tuple[RerankConfig, GlobalConfig]:
         rerank_conf = RerankConfig(
@@ -34,8 +21,6 @@ class RecommendationRuntimeConfig:
             top_n=self.top_n,
             ratios=list(self.ratios),
             an_impactful_features=self.an_impactful_features,
-            recommendation_stage=self.recommendation_stage.value,
-            popularity_action_weights=dict(self.popularity_action_weights),
         )
         global_conf = GlobalConfig(
             n_max_candidates=self.n_max_candidates,
