@@ -1,5 +1,4 @@
 from collections.abc import Mapping
-from functools import lru_cache
 from typing import Any
 
 
@@ -605,40 +604,6 @@ def get_feature_label(feature_name: Any) -> str:
     return key
 
 
-FEATURE_REASON_ALIASES = {
-    "days_since_first_txn": "first_txn_dttm",
-    "days_since_last_txn": "last_txn_dttm",
-    "activity_length_days": "activity_span_days",
-}
-
-
-def get_feature_mapper(feature_name: Any) -> str | None:
-    key = str(feature_name).strip()
-    if not key:
-        return None
-
-    if key in _get_reason_mapper_value_set():
-        return key
-
-    resolved_feature_key = _resolve_feature_key(key)
-    if resolved_feature_key is None:
-        return None
-
-    raw_meta = FEATURE_REASON_MAPPER.get(resolved_feature_key)
-    if not isinstance(raw_meta, Mapping):
-        return None
-
-    mapper_value = raw_meta.get("mapper")
-    if mapper_value is None:
-        return None
-
-    mapper_text = str(mapper_value).strip()
-    if not mapper_text:
-        return None
-
-    return mapper_text
-
-
 def map_feature_impacts_to_labels(raw_reasons: Any) -> dict[str, float]:
     feature_impacts = _normalize_feature_impacts(raw_reasons)
     if not feature_impacts:
@@ -646,13 +611,46 @@ def map_feature_impacts_to_labels(raw_reasons: Any) -> dict[str, float]:
 
     labels_with_impacts: dict[str, float] = {}
     for feature_name, impact in feature_impacts.items():
-        label = get_feature_mapper(feature_name)
-        if label is None:
-            continue
+        label = get_feature_label(feature_name)
         current = labels_with_impacts.get(label)
         if current is None or impact > current:
             labels_with_impacts[label] = impact
     return labels_with_impacts
+
+
+def build_exact_reasons(
+    raw_reasons: Any,
+    *,
+    exact_count: int = 3,
+) -> dict[str, float] | None:
+    if exact_count <= 0:
+        return {}
+
+    feature_impacts = _normalize_feature_impacts(raw_reasons)
+    sorted_feature_impacts = sorted(
+        feature_impacts.items(),
+        key=lambda item: (-float(item[1]), str(item[0])),
+    )
+
+    reasons: dict[str, float] = {}
+    for feature_name, impact in sorted_feature_impacts:
+        label = get_feature_mapper(feature_name)
+        if label is None or label in reasons:
+            continue
+        reasons[label] = float(impact)
+        if len(reasons) >= exact_count:
+            return reasons
+
+    fallback_score = _resolve_fallback_reason_score(reasons)
+    for mapper_value in get_reason_mapper_values():
+        if mapper_value in reasons:
+            continue
+        reasons[mapper_value] = fallback_score
+        fallback_score = round(max(fallback_score - 0.001, 0.0), 4)
+        if len(reasons) >= exact_count:
+            return reasons
+
+    return None
 
 
 def get_reason_mapper_values() -> list[str]:
@@ -676,33 +674,6 @@ def get_reason_mapper_values() -> list[str]:
     return mapper_values
 
 
-def _resolve_feature_key(feature_key: str) -> str | None:
-    if feature_key in FEATURE_REASON_MAPPER:
-        return feature_key
-
-    alias_key = FEATURE_REASON_ALIASES.get(feature_key)
-    if alias_key is not None and alias_key in FEATURE_REASON_MAPPER:
-        return alias_key
-
-    current_key = feature_key
-    while "_" in current_key:
-        current_key = current_key.rsplit("_", 1)[0]
-
-        if current_key in FEATURE_REASON_MAPPER:
-            return current_key
-
-        alias_key = FEATURE_REASON_ALIASES.get(current_key)
-        if alias_key is not None and alias_key in FEATURE_REASON_MAPPER:
-            return alias_key
-
-    return None
-
-
-@lru_cache(maxsize=1)
-def _get_reason_mapper_value_set() -> frozenset[str]:
-    return frozenset(get_reason_mapper_values())
-
-
 def _normalize_feature_impacts(raw_reasons: Any) -> dict[str, float]:
     if raw_reasons is None:
         return {}
@@ -721,3 +692,18 @@ def _normalize_feature_impacts(raw_reasons: Any) -> dict[str, float]:
         return {str(feature_name): 0.0 for feature_name in raw_reasons}
 
     return {str(raw_reasons): 0.0}
+
+
+def _resolve_fallback_reason_score(existing_reasons: dict[str, float]) -> float:
+    numeric_scores = [
+        float(score)
+        for score in existing_reasons.values()
+        if isinstance(score, int | float)
+    ]
+    if not numeric_scores:
+        return 0.05
+
+    min_score = min(numeric_scores)
+    if min_score <= 0:
+        return 0.0
+    return round(min_score / 2.0, 4)
