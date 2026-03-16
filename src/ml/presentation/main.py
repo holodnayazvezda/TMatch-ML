@@ -4,8 +4,9 @@ import sys
 import structlog
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse
 
 from ml.config import settings
 from ml.candidates import interactions_candidates, transactions_candidates
@@ -28,6 +29,15 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(recommendation_router)
     app.state.interaction_event_poller = InteractionEventPoller()
+
+    @app.exception_handler(Exception)
+    async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+        log.exception(
+            "unhandled_exception",
+            path=request.url.path,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
     @app.on_event("startup")
     async def warmup_faiss_cache() -> None:

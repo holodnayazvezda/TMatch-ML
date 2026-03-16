@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 
+import structlog
 from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
@@ -18,6 +19,7 @@ from ml.services.recommendation_store import (
 )
 from ml.services.user_id import normalize_user_id
 
+log = structlog.get_logger(__name__)
 router = APIRouter(prefix="/recommendation", tags=["recommendation"])
 
 
@@ -32,6 +34,7 @@ async def recommendation(payload: RecommendationRequest) -> JSONResponse:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
+        log.exception("recommendation_request_failed")
         raise HTTPException(status_code=500, detail=f"Failed to process request: {exc}") from exc
 
     return JSONResponse(status_code=200, content=recommendations)
