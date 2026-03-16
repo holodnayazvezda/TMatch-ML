@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from time import perf_counter
 
 import pandas as pd
 import structlog
@@ -10,7 +11,7 @@ from ml.explanation import build_exact_reasons
 from ml.infra.blocked_service import InteractionBlocklistService
 from ml.ml_config import RerankConfig
 from ml.retrieval import collect_retrieval_candidates
-from ml.services.recommendation_constraints import filter_candidate_frame_by_targeting
+from ml.services.recommendation_constraints import UserTargetingProfile, filter_candidate_frame_by_targeting
 from ml.services.recommendation_feature_snapshot import attach_feature_snapshots
 from ml.services.recommendation_ranking import resolve_model_family, score_candidate_frame
 from ml.services.recommendation_runtime_config import RecommendationRuntimeConfig
@@ -30,6 +31,7 @@ def get_recommendations_for_user(
     conf: RerankConfig,
     g_conf: GlobalConfig,
 ) -> pd.DataFrame:
+    request_started = perf_counter()
     normalized_user_id = normalize_user_id(user_id, allow_hash=True)
     if normalized_user_id is None:
         return pd.DataFrame()
@@ -42,7 +44,9 @@ def get_recommendations_for_user(
         stage=stage.value,
         has_transaction_profile=has_transaction_profile,
     )
+    targeting_profile_cache: dict[str, UserTargetingProfile] = {}
 
+    step_started = perf_counter()
     primary_df = _assemble_primary_candidates(
         stage=stage,
         user_id=normalized_user_id,
@@ -51,7 +55,29 @@ def get_recommendations_for_user(
         conf=conf,
         g_conf=g_conf,
     )
-    filtered_primary_df = _apply_hard_filters(primary_df, actor_user_id=normalized_user_id)
+    _log_step_timing(
+        user_id=normalized_user_id,
+        stage=stage,
+        step="primary_retrieval",
+        started_at=step_started,
+        candidate_df=primary_df,
+    )
+
+    step_started = perf_counter()
+    filtered_primary_df = _apply_hard_filters(
+        primary_df,
+        actor_user_id=normalized_user_id,
+        targeting_profile_cache=targeting_profile_cache,
+    )
+    _log_step_timing(
+        user_id=normalized_user_id,
+        stage=stage,
+        step="hard_filters_primary",
+        started_at=step_started,
+        candidate_df=filtered_primary_df,
+    )
+
+    step_started = perf_counter()
     ranked_df = _apply_ranking_if_available(
         primary_df=filtered_primary_df,
         stage=stage,
@@ -59,8 +85,35 @@ def get_recommendations_for_user(
         and stage in {RecommendationStage.STAGE_2, RecommendationStage.STAGE_3, RecommendationStage.STAGE_4},
         runtime_config=runtime_config,
     )
+    _log_step_timing(
+        user_id=normalized_user_id,
+        stage=stage,
+        step="ranking",
+        started_at=step_started,
+        candidate_df=ranked_df,
+    )
+
+    step_started = perf_counter()
     prepared_df = _prepare_candidate_reasons(ranked_df)
+    _log_step_timing(
+        user_id=normalized_user_id,
+        stage=stage,
+        step="reason_preparation",
+        started_at=step_started,
+        candidate_df=prepared_df,
+    )
+
+    step_started = perf_counter()
     prepared_df = _annotate_shown_history(prepared_df, actor_user_id=normalized_user_id)
+    _log_step_timing(
+        user_id=normalized_user_id,
+        stage=stage,
+        step="shown_history_annotation_primary",
+        started_at=step_started,
+        candidate_df=prepared_df,
+    )
+
+    step_started = perf_counter()
     finalized_df = _fallback_if_needed(
         prepared_df,
         stage=stage,
@@ -68,12 +121,35 @@ def get_recommendations_for_user(
         has_transaction_profile=has_transaction_profile,
         conf=conf,
         top_n=g_conf.n_rec_users,
+        targeting_profile_cache=targeting_profile_cache,
     )
-    result_df = _return_top_n(finalized_df, actor_user_id=normalized_user_id, top_n=g_conf.n_rec_users)
+    _log_step_timing(
+        user_id=normalized_user_id,
+        stage=stage,
+        step="fallback_chain",
+        started_at=step_started,
+        candidate_df=finalized_df,
+    )
+
+    step_started = perf_counter()
+    result_df = _return_top_n(
+        finalized_df,
+        actor_user_id=normalized_user_id,
+        top_n=g_conf.n_rec_users,
+        targeting_profile_cache=targeting_profile_cache,
+    )
+    _log_step_timing(
+        user_id=normalized_user_id,
+        stage=stage,
+        step="final_assembly",
+        started_at=step_started,
+        candidate_df=result_df,
+    )
     log.info(
         "recommendation_candidates_finalized",
         user_id=normalized_user_id,
         stage=stage.value,
+        elapsed_ms=round((perf_counter() - request_started) * 1000, 2),
         final_count=int(result_df.shape[0]),
         final_candidate_ids=result_df.get("candidate_id", pd.Series(dtype="string")).astype("string").tolist(),
     )
@@ -169,7 +245,12 @@ def _apply_ranking_if_available(
     ).reset_index(drop=True)
 
 
-def _apply_hard_filters(candidate_df: pd.DataFrame, *, actor_user_id: str) -> pd.DataFrame:
+def _apply_hard_filters(
+    candidate_df: pd.DataFrame,
+    *,
+    actor_user_id: str,
+    targeting_profile_cache: dict[str, UserTargetingProfile] | None = None,
+) -> pd.DataFrame:
     if candidate_df.empty:
         return candidate_df
 
@@ -183,7 +264,11 @@ def _apply_hard_filters(candidate_df: pd.DataFrame, *, actor_user_id: str) -> pd
         return result.reset_index(drop=True)
 
     result = _apply_pair_state_filters(result, actor_user_id=actor_user_id)
-    result = _apply_targeting_filters(result, actor_user_id=actor_user_id)
+    result = _apply_targeting_filters(
+        result,
+        actor_user_id=actor_user_id,
+        targeting_profile_cache=targeting_profile_cache,
+    )
     return result.reset_index(drop=True)
 
 
@@ -201,8 +286,9 @@ def _apply_pair_state_filters(candidate_df: pd.DataFrame, *, actor_user_id: str)
             "recommendation_pair_state_filter_failed",
             actor_user_id=actor_user_id,
             error=str(exc),
+            degraded_mode="fail_open",
         )
-        return candidate_df.iloc[0:0].copy()
+        return candidate_df.reset_index(drop=True)
 
     before_count = int(candidate_df.shape[0])
     result = candidate_df[~candidate_df["candidate_id"].isin(blocked_candidate_ids)].copy()
@@ -211,12 +297,19 @@ def _apply_pair_state_filters(candidate_df: pd.DataFrame, *, actor_user_id: str)
         log.info(
             "recommendation_pair_state_filter_applied",
             actor_user_id=actor_user_id,
+            before_count=before_count,
+            after_count=int(result.shape[0]),
             removed_count=removed_count,
         )
     return result.reset_index(drop=True)
 
 
-def _apply_targeting_filters(candidate_df: pd.DataFrame, *, actor_user_id: str) -> pd.DataFrame:
+def _apply_targeting_filters(
+    candidate_df: pd.DataFrame,
+    *,
+    actor_user_id: str,
+    targeting_profile_cache: dict[str, UserTargetingProfile] | None = None,
+) -> pd.DataFrame:
     if candidate_df.empty:
         return candidate_df
 
@@ -224,20 +317,35 @@ def _apply_targeting_filters(candidate_df: pd.DataFrame, *, actor_user_id: str) 
         result = filter_candidate_frame_by_targeting(
             candidate_df,
             actor_user_id=actor_user_id,
+            profile_cache=targeting_profile_cache,
         )
     except Exception as exc:
         log.warning(
             "recommendation_targeting_filter_failed",
             actor_user_id=actor_user_id,
             error=str(exc),
+            degraded_mode="fail_open",
         )
-        return candidate_df.iloc[0:0].copy()
+        return candidate_df.reset_index(drop=True)
 
-    removed_count = int(candidate_df.shape[0]) - int(result.shape[0])
+    before_count = int(candidate_df.shape[0])
+    after_count = int(result.shape[0])
+    removed_count = before_count - after_count
+    if before_count > 0 and after_count == 0:
+        log.warning(
+            "recommendation_targeting_filter_degraded",
+            actor_user_id=actor_user_id,
+            before_count=before_count,
+            removed_count=removed_count,
+            degraded_mode="all_removed_fail_open",
+        )
+        return candidate_df.reset_index(drop=True)
     if removed_count > 0:
         log.info(
             "recommendation_targeting_filter_applied",
             actor_user_id=actor_user_id,
+            before_count=before_count,
+            after_count=after_count,
             removed_count=removed_count,
         )
     return result.reset_index(drop=True)
@@ -310,14 +418,18 @@ def _fallback_if_needed(
     has_transaction_profile: bool,
     conf: RerankConfig,
     top_n: int,
+    targeting_profile_cache: dict[str, UserTargetingProfile] | None = None,
 ) -> pd.DataFrame:
-    from ml.candidates import exotic_candidates, popularity_fallback
+    from ml.candidates import exotic_candidates, popularity_fallback, transactions_candidates
 
     result = _dedupe_candidates(candidate_df)
     if _count_fresh_candidates(result) >= int(top_n):
         return result
 
+    fallback_conf = _build_fallback_conf(conf, top_n=top_n)
     fallback_sequence = []
+    if has_transaction_profile:
+        fallback_sequence.append(("transactions", transactions_candidates.get_transaction_candidates))
     if stage != RecommendationStage.STAGE_1 or has_transaction_profile:
         fallback_sequence.append(("popularity", popularity_fallback.get_popular_candidates))
     fallback_sequence.append(("exotic", exotic_candidates.get_exotic_candidates))
@@ -326,25 +438,51 @@ def _fallback_if_needed(
         if _count_fresh_candidates(result) >= int(top_n):
             break
 
-        fallback_df = _safe_fetch(fetcher, conf)
+        source_started = perf_counter()
+        fallback_df = _safe_fetch(fetcher, fallback_conf)
+        fetched_count = int(fallback_df.shape[0])
         fallback_df = attach_feature_snapshots(fallback_df, actor_user_id=user_id, stage=stage)
-        fallback_df = _apply_hard_filters(fallback_df, actor_user_id=user_id)
+        with_features_count = int(fallback_df.shape[0])
+        fallback_df = _apply_hard_filters(
+            fallback_df,
+            actor_user_id=user_id,
+            targeting_profile_cache=targeting_profile_cache,
+        )
+        post_hard_filters_count = int(fallback_df.shape[0])
         fallback_df = _prepare_candidate_reasons(fallback_df)
+        post_reason_count = int(fallback_df.shape[0])
         fallback_df = _annotate_shown_history(fallback_df, actor_user_id=user_id)
+        post_shown_count = int(fallback_df.shape[0])
         result = _dedupe_candidates(pd.concat([result, fallback_df], ignore_index=True))
         log.info(
             "recommendation_fallback_applied",
             user_id=user_id,
             stage=stage.value,
             fallback_source=source_name,
+            elapsed_ms=round((perf_counter() - source_started) * 1000, 2),
+            fetched_count=fetched_count,
+            with_features_count=with_features_count,
+            post_hard_filters_count=post_hard_filters_count,
+            post_reason_count=post_reason_count,
+            post_shown_count=post_shown_count,
             current_count=int(result.shape[0]),
             current_fresh_count=_count_fresh_candidates(result),
         )
     return result
 
 
-def _return_top_n(candidate_df: pd.DataFrame, *, actor_user_id: str, top_n: int) -> pd.DataFrame:
-    filtered_df = _apply_hard_filters(candidate_df, actor_user_id=actor_user_id)
+def _return_top_n(
+    candidate_df: pd.DataFrame,
+    *,
+    actor_user_id: str,
+    top_n: int,
+    targeting_profile_cache: dict[str, UserTargetingProfile] | None = None,
+) -> pd.DataFrame:
+    filtered_df = _apply_hard_filters(
+        candidate_df,
+        actor_user_id=actor_user_id,
+        targeting_profile_cache=targeting_profile_cache,
+    )
     prepared_df = _prepare_candidate_reasons(filtered_df)
     annotated_df = _annotate_shown_history(prepared_df, actor_user_id=actor_user_id)
     deduped_df = _dedupe_candidates(annotated_df)
@@ -441,14 +579,52 @@ def _safe_fetch(fetcher, conf: RerankConfig) -> pd.DataFrame:
     return source_df.copy()
 
 
+def _build_fallback_conf(conf, *, top_n: int):
+    if not isinstance(conf, RerankConfig):
+        return conf
+    fallback_top_n = max(int(top_n) * 12, 40)
+    configured_top_n = int(getattr(conf, "top_n", 0) or 0)
+    if configured_top_n > 0:
+        fallback_top_n = min(fallback_top_n, configured_top_n)
+    return replace(conf, top_n=max(fallback_top_n, int(top_n)))
+
+
+def _log_step_timing(
+    *,
+    user_id: str,
+    stage: RecommendationStage,
+    step: str,
+    started_at: float,
+    candidate_df: pd.DataFrame | None = None,
+) -> None:
+    payload = {
+        "user_id": user_id,
+        "stage": stage.value,
+        "step": step,
+        "elapsed_ms": round((perf_counter() - started_at) * 1000, 2),
+    }
+    if candidate_df is not None:
+        payload["candidate_count"] = int(candidate_df.shape[0])
+        payload["fresh_candidate_count"] = _count_fresh_candidates(candidate_df)
+    log.info("recommendation_step_timing", **payload)
+
+
 def _log_source_counts(candidate_df: pd.DataFrame, *, stage: RecommendationStage, user_id: str) -> None:
     if candidate_df.empty:
-        log.info("recommendation_candidate_counts", user_id=user_id, stage=stage.value, total_count=0)
+        log.info(
+            "recommendation_candidate_counts",
+            user_id=user_id,
+            stage=stage.value,
+            phase="primary_retrieval",
+            total_count=0,
+        )
         return
 
     counts = {
+        "phase": "primary_retrieval",
         "total_count": int(candidate_df.shape[0]),
     }
+    has_source_specific_metrics = False
     retrieval_flag_columns = {
         "transactions_count": "retrieval_transactions_is_candidate",
         "interaction_count": "retrieval_tx_interaction_is_candidate",
@@ -458,8 +634,9 @@ def _log_source_counts(candidate_df: pd.DataFrame, *, stage: RecommendationStage
     for output_name, column_name in retrieval_flag_columns.items():
         if column_name in candidate_df.columns:
             counts[output_name] = int(pd.to_numeric(candidate_df[column_name], errors="coerce").fillna(0).sum())
+            has_source_specific_metrics = True
 
-    if len(counts) == 1:
+    if not has_source_specific_metrics:
         counts["source_order_count"] = int(candidate_df.shape[0])
 
     log.info("recommendation_candidate_counts", user_id=user_id, stage=stage.value, **counts)

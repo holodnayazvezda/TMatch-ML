@@ -8,6 +8,7 @@ from typing import Any
 
 from sqlalchemy import select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.engine import Connection
 from sqlalchemy.orm import Session
 
 from ml.infra.db.init_db import init_db
@@ -16,7 +17,7 @@ from ml.infra.db.models import (
     MLRecommendationGroup,
     MLRecommendationImpression,
 )
-from ml.infra.db.session import SessionLocal
+from ml.infra.db.session import SessionLocal, engine
 from ml.services.interaction_ingestion import TRAINING_INTERACTION_ACTIONS
 from ml.services.recommendation_scoring import PREDICTION_COLUMN_BY_TARGET
 from ml.services.user_id import normalize_user_id
@@ -178,22 +179,26 @@ def run_with_user_recommendation_lock(
     )
     init_db()
 
-    with SessionLocal() as session:
-        _acquire_user_recommendation_lock(session, normalized_actor_user_id)
+    with engine.connect() as lock_connection:
+        _acquire_user_recommendation_lock(lock_connection, normalized_actor_user_id)
         try:
-            with session.begin():
-                pending_group_ids = _list_pending_group_ids_for_user_in_session(session, normalized_actor_user_id)
-
-            if pending_group_ids:
-                time.sleep(max(float(poll_wait_seconds), 0.0))
+            with SessionLocal() as session:
                 with session.begin():
-                    unresolved_group_ids = _list_pending_group_ids_for_user_in_session(session, normalized_actor_user_id)
-                    if unresolved_group_ids:
-                        discard_groups_in_session(session, unresolved_group_ids)
+                    pending_group_ids = _list_pending_group_ids_for_user_in_session(session, normalized_actor_user_id)
 
-            return callback(session)
+                if pending_group_ids:
+                    time.sleep(max(float(poll_wait_seconds), 0.0))
+                    with session.begin():
+                        unresolved_group_ids = _list_pending_group_ids_for_user_in_session(
+                            session,
+                            normalized_actor_user_id,
+                        )
+                        if unresolved_group_ids:
+                            discard_groups_in_session(session, unresolved_group_ids)
+
+                return callback(session)
         finally:
-            _release_user_recommendation_lock(session, normalized_actor_user_id)
+            _release_user_recommendation_lock(lock_connection, normalized_actor_user_id)
 
 
 def get_pending_group_for_user(actor_user_id: str) -> dict[str, Any] | None:
@@ -696,25 +701,26 @@ def _to_json_safe(value: Any) -> Any:
     return value
 
 
-def _acquire_user_recommendation_lock(session: Session, actor_user_id: str) -> None:
+def _acquire_user_recommendation_lock(connection: Connection, actor_user_id: str) -> None:
     lock_key = _build_recommendation_lock_key(actor_user_id)
-    session.execute(
+    connection.execute(
         text("SELECT pg_advisory_lock(:lock_key)"),
         {"lock_key": lock_key},
     )
-    session.commit()
+    connection.commit()
 
 
-def _release_user_recommendation_lock(session: Session, actor_user_id: str) -> None:
+def _release_user_recommendation_lock(connection: Connection, actor_user_id: str) -> None:
     lock_key = _build_recommendation_lock_key(actor_user_id)
     try:
-        session.execute(
+        connection.execute(
             text("SELECT pg_advisory_unlock(:lock_key)"),
             {"lock_key": lock_key},
         )
-        session.commit()
+        connection.commit()
     except Exception:
-        session.rollback()
+        # unlock failure is non-fatal here because connection close will rollback and release resources
+        connection.rollback()
 
 
 def _build_recommendation_lock_key(actor_user_id: str) -> int:

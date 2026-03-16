@@ -223,10 +223,15 @@ def _prepare_source_frame(
     else:
         score_values = pd.Series(np.nan, index=source_df.index, dtype=float)
 
-    result = source_df[[QUERY_ID_COLUMN, CANDIDATE_ID_COLUMN]].copy()
-    result[is_candidate_col] = 1
-    result[rank_col] = source_df["_source_rank"].astype(float)
-    result[score_col] = score_values.astype(float)
+    base_frame = source_df[[QUERY_ID_COLUMN, CANDIDATE_ID_COLUMN]].copy()
+    retrieval_flags_frame = pd.DataFrame(
+        {
+            is_candidate_col: pd.Series(1, index=source_df.index, dtype="int8"),
+            rank_col: source_df["_source_rank"].astype(float),
+            score_col: score_values.astype(float),
+        },
+        index=source_df.index,
+    )
 
     feature_columns_to_skip = {
         QUERY_ID_COLUMN,
@@ -236,11 +241,21 @@ def _prepare_source_frame(
         source_rank_column,
         "_source_rank",
     }
-    for column in source_df.columns:
-        if column in feature_columns_to_skip:
-            continue
-        prefixed_column = f"retrieval_{source_name}_feature_{column}"
-        result[prefixed_column] = source_df[column]
+    feature_columns = [column for column in source_df.columns if column not in feature_columns_to_skip]
+    if feature_columns:
+        feature_frame = source_df[feature_columns].copy()
+        feature_frame.columns = [f"retrieval_{source_name}_feature_{column}" for column in feature_columns]
+        result = pd.concat(
+            [base_frame, retrieval_flags_frame, feature_frame],
+            axis=1,
+            copy=False,
+        )
+    else:
+        result = pd.concat(
+            [base_frame, retrieval_flags_frame],
+            axis=1,
+            copy=False,
+        )
 
     result = result.drop_duplicates(
         subset=[QUERY_ID_COLUMN, CANDIDATE_ID_COLUMN],
@@ -279,20 +294,17 @@ def _add_common_retrieval_features(merged: pd.DataFrame, source_names: list[str]
     is_candidate_cols = [f"retrieval_{name}_is_candidate" for name in source_names]
     rank_cols = [f"retrieval_{name}_rank" for name in source_names]
     score_cols = [f"retrieval_{name}_score" for name in source_names]
+    source_presence = merged[is_candidate_cols].fillna(0).astype("int8")
 
-    merged["retrieval_sources_count"] = merged[is_candidate_cols].sum(axis=1).astype("int16")
+    merged["retrieval_sources_count"] = source_presence.sum(axis=1).astype("int16")
     merged["retrieval_best_rank"] = merged[rank_cols].min(axis=1, skipna=True)
     merged["retrieval_mean_rank"] = merged[rank_cols].mean(axis=1, skipna=True)
     merged["retrieval_best_score"] = merged[score_cols].max(axis=1, skipna=True)
     merged["retrieval_mean_score"] = merged[score_cols].mean(axis=1, skipna=True)
-    merged["retrieval_sources"] = merged.apply(
-        lambda row: ",".join(
-            source_name
-            for source_name in source_names
-            if row.get(f"retrieval_{source_name}_is_candidate", 0) == 1
-        ),
-        axis=1,
-    )
+    merged["retrieval_sources"] = [
+        ",".join(source_name for source_name, is_present in zip(source_names, row, strict=False) if is_present == 1)
+        for row in source_presence.to_numpy(dtype="int8")
+    ]
     merged["retrieval_primary_source"] = merged[rank_cols].idxmin(axis=1, skipna=True).str.replace(
         "retrieval_", "",
     ).str.replace("_rank", "")

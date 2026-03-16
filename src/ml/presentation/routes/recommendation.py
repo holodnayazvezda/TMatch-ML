@@ -1,6 +1,5 @@
 from datetime import datetime, timezone
 
-import structlog
 from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse

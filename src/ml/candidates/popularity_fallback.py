@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import pandas as pd
-from sqlalchemy import select
+from sqlalchemy import case, func, select
 
 from ml.candidates import transactions_candidates
 from ml.infra.blocked_service import InteractionBlocklistService
@@ -34,14 +34,31 @@ def get_popular_candidates(conf) -> pd.DataFrame:
             "block": -15.0,
         }
 
+    query_limit = max(top_n * 20, top_n)
     try:
+        action_weight_expression = case(
+            *(
+                (
+                    func.lower(func.trim(Interaction.action)) == action,
+                    float(weight),
+                )
+                for action, weight in weights.items()
+            ),
+            else_=0.0,
+        )
         with SessionLocal() as session:
             stmt = (
                 select(
                     Interaction.candidate_user_id,
-                    Interaction.action,
+                    func.sum(action_weight_expression).label("popularity_score"),
                 )
                 .where(Interaction.deleted_at.is_(None))
+                .group_by(Interaction.candidate_user_id)
+                .order_by(
+                    func.sum(action_weight_expression).desc(),
+                    Interaction.candidate_user_id.asc(),
+                )
+                .limit(query_limit)
             )
             rows = list(session.execute(stmt).all())
     except Exception:
@@ -51,15 +68,11 @@ def get_popular_candidates(conf) -> pd.DataFrame:
         return pd.DataFrame()
 
     popularity_by_candidate: dict[str, float] = {}
-    for candidate_user_id, action in rows:
+    for candidate_user_id, popularity_score in rows:
         normalized_candidate_user_id = normalize_user_id(candidate_user_id, allow_hash=True)
-        normalized_action = str(action).strip().lower()
         if normalized_candidate_user_id is None:
             continue
-        popularity_by_candidate[normalized_candidate_user_id] = (
-            popularity_by_candidate.get(normalized_candidate_user_id, 0.0)
-            + float(weights.get(normalized_action, 0.0))
-        )
+        popularity_by_candidate[normalized_candidate_user_id] = float(popularity_score)
 
     if not popularity_by_candidate:
         return pd.DataFrame()

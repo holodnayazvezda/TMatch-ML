@@ -21,8 +21,6 @@ DAILY_FEATURES_PATH = FEATURES_DIR / f"daily_features_{PIPELINE_VERSION}.parquet
 CATEGORY_FEATURES_PATH = FEATURES_DIR / f"category_features_{PIPELINE_VERSION}.parquet"
 MCC_FEATURES_PATH = FEATURES_DIR / f"mcc_features_{PIPELINE_VERSION}.parquet"
 MERCHANT_FEATURES_PATH = FEATURES_DIR / f"merchant_features_{PIPELINE_VERSION}.parquet"
-
-# Canonical transaction feature snapshot for downstream retrieval.
 FINAL_PARQUET_PATH = PATHS.transaction_user_features_parquet_path
 FINAL_CSV_PATH = PATHS.transaction_user_features_csv_path
 
@@ -133,6 +131,7 @@ def validate_inputs() -> list[Path]:
     csv_files = []
     for i in range(1, 2):
         folder = DATA_DIR / f"Data_{i}"
+        print(folder)
         if folder.exists():
             csv_files.extend(sorted(folder.glob("*.csv")))
 

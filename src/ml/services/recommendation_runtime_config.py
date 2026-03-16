@@ -12,7 +12,7 @@ from ml.services.recommendation_scoring import (
 
 @dataclass(frozen=True)
 class RecommendationRuntimeConfig:
-    recommendation_stage: RecommendationStage = RecommendationStage.STAGE_1
+    recommendation_stage: RecommendationStage = RecommendationStage.STAGE_4
     rerank_mode: int = 0
     top_n: int = 150
     ratios: tuple[float, ...] = (0.25, 0.25, 0.25, 0.25)

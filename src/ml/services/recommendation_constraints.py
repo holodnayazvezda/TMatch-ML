@@ -20,6 +20,7 @@ class UserTargetingProfile:
     gender_target: str
     age_from: int
     age_to: int
+    has_targeting_preferences: bool = True
 
 
 def filter_candidate_frame_by_targeting(
@@ -27,6 +28,7 @@ def filter_candidate_frame_by_targeting(
     *,
     actor_user_id: str,
     as_of: date | None = None,
+    profile_cache: dict[str, UserTargetingProfile] | None = None,
 ) -> pd.DataFrame:
     if candidate_df.empty:
         return candidate_df
@@ -37,27 +39,33 @@ def filter_candidate_frame_by_targeting(
 
     normalized_actor_user_id = normalize_user_id(actor_user_id, allow_hash=True)
     if normalized_actor_user_id is None:
-        return result.iloc[0:0].copy()
+        return result.reset_index(drop=True)
 
     candidate_ids = _normalize_user_ids(result["candidate_id"].tolist())
-    constraint_lookup = load_user_targeting_profiles(
-        [normalized_actor_user_id, *candidate_ids],
-        as_of=as_of,
-    )
+    required_user_ids = [normalized_actor_user_id, *candidate_ids]
+    if profile_cache is None:
+        constraint_lookup = load_user_targeting_profiles(required_user_ids, as_of=as_of)
+    else:
+        missing_user_ids = [user_id for user_id in required_user_ids if user_id not in profile_cache]
+        if missing_user_ids:
+            profile_cache.update(load_user_targeting_profiles(missing_user_ids, as_of=as_of))
+        constraint_lookup = profile_cache
+
     actor_profile = constraint_lookup.get(normalized_actor_user_id)
     if actor_profile is None:
-        return result.iloc[0:0].copy()
+        return result.reset_index(drop=True)
 
-    allowed_candidate_ids = {
-        candidate_id
-        for candidate_id in candidate_ids
-        if (
-            candidate_profile := constraint_lookup.get(candidate_id)
-        ) is not None
-        and is_mutually_targeting_compatible(actor_profile, candidate_profile)
-    }
+    allowed_candidate_ids: set[str] = set()
+    for candidate_id in candidate_ids:
+        candidate_profile = constraint_lookup.get(candidate_id)
+        if candidate_profile is None:
+            allowed_candidate_ids.add(candidate_id)
+            continue
+        if is_mutually_targeting_compatible(actor_profile, candidate_profile):
+            allowed_candidate_ids.add(candidate_id)
+
     if not allowed_candidate_ids:
-        return result.iloc[0:0].copy()
+        return result.reset_index(drop=True)
 
     filtered = result[result["candidate_id"].isin(allowed_candidate_ids)].copy()
     return filtered.reset_index(drop=True)
@@ -108,10 +116,12 @@ def is_mutually_targeting_compatible(
     actor_profile: UserTargetingProfile,
     candidate_profile: UserTargetingProfile,
 ) -> bool:
-    return _matches_targeting(actor_profile, candidate_profile) and _matches_targeting(
-        candidate_profile,
-        actor_profile,
-    )
+    actor_compatible = _matches_targeting(actor_profile, candidate_profile)
+    if not actor_compatible:
+        return False
+    if not candidate_profile.has_targeting_preferences:
+        return True
+    return _matches_targeting(candidate_profile, actor_profile)
 
 
 def _matches_targeting(
@@ -135,11 +145,15 @@ def _build_user_targeting_profile(
     user_id = normalize_user_id(raw_row.get("user_id"), allow_hash=True)
     gender = _normalize_gender(raw_row.get("gender"))
     age = _resolve_age(raw_row.get("birth_date"), as_of=as_of)
-    gender_target = _normalize_gender_target(raw_row.get("gender_target"))
-    age_range = _normalize_age_range(raw_row.get("age_from"), raw_row.get("age_to"))
+    raw_gender_target = _normalize_gender_target(raw_row.get("gender_target"))
+    raw_age_range = _normalize_age_range(raw_row.get("age_from"), raw_row.get("age_to"))
 
-    if user_id is None or gender is None or age is None or gender_target is None or age_range is None:
+    if user_id is None or gender is None or age is None:
         return None
+
+    has_targeting_preferences = raw_gender_target is not None and raw_age_range is not None
+    gender_target = raw_gender_target or "any"
+    age_range = raw_age_range or (18, 100)
 
     return UserTargetingProfile(
         user_id=user_id,
@@ -148,6 +162,7 @@ def _build_user_targeting_profile(
         gender_target=gender_target,
         age_from=age_range[0],
         age_to=age_range[1],
+        has_targeting_preferences=has_targeting_preferences,
     )
 
 

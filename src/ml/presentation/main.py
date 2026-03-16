@@ -13,6 +13,7 @@ from ml.candidates import interactions_candidates, transactions_candidates
 from ml.infra.logging.structlog import configure_logging
 from ml.presentation.routes.health import router as health_router
 from ml.presentation.routes.recommendation import router as recommendation_router
+from ml.presentation.routes.user_description import router as user_description_router
 from ml.services.interaction_event_poller import InteractionEventPoller
 from ml.services.recommendation_runtime_config import DEFAULT_RECOMMENDATION_RUNTIME_CONFIG
 from ml.services.recommendation_scoring import RecommendationStage
@@ -28,6 +29,7 @@ def create_app() -> FastAPI:
     )
     app.include_router(health_router)
     app.include_router(recommendation_router)
+    app.include_router(user_description_router)
     app.state.interaction_event_poller = InteractionEventPoller()
 
     @app.exception_handler(Exception)

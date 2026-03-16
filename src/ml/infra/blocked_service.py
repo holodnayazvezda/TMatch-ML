@@ -3,7 +3,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import String, cast, func, or_, select
+from sqlalchemy.exc import DBAPIError
 
 from core.config import CONFIG
 from ml.services.user_id import normalize_user_id
@@ -13,6 +14,11 @@ from .db.session import SessionLocal
 
 
 class InteractionBlocklistService:
+    def __init__(self) -> None:
+        # Keep fast UUID-native comparisons by default and switch to text mode
+        # only when the runtime schema stores IDs as varchar.
+        self._compare_ids_as_text = False
+
     def is_blocked(self, actor_user_id: str, candidate_user_id: str) -> bool:
         return candidate_user_id in self.get_blocked_targets(
             actor_user_id=actor_user_id,
@@ -61,15 +67,44 @@ class InteractionBlocklistService:
         actor_user_id: str,
         candidate_user_ids: list[str],
     ) -> list[tuple[str, str, str, datetime]]:
+        try:
+            return self._execute_latest_interactions_query(
+                actor_user_id=actor_user_id,
+                candidate_user_ids=candidate_user_ids,
+                compare_ids_as_text=self._compare_ids_as_text,
+            )
+        except DBAPIError as exc:
+            if self._compare_ids_as_text or not _is_uuid_varchar_operator_mismatch_error(exc):
+                raise
+            self._compare_ids_as_text = True
+            return self._execute_latest_interactions_query(
+                actor_user_id=actor_user_id,
+                candidate_user_ids=candidate_user_ids,
+                compare_ids_as_text=True,
+            )
+
+    def _execute_latest_interactions_query(
+        self,
+        *,
+        actor_user_id: str,
+        candidate_user_ids: list[str],
+        compare_ids_as_text: bool,
+    ) -> list[tuple[str, str, str, datetime]]:
+        actor_id_column = Interaction.actor_user_id
+        candidate_id_column = Interaction.candidate_user_id
+        if compare_ids_as_text:
+            actor_id_column = cast(Interaction.actor_user_id, String)
+            candidate_id_column = cast(Interaction.candidate_user_id, String)
+
         latest_interactions = (
             select(
-                Interaction.actor_user_id.label("actor_user_id"),
-                Interaction.candidate_user_id.label("candidate_user_id"),
+                actor_id_column.label("actor_user_id"),
+                candidate_id_column.label("candidate_user_id"),
                 Interaction.action.label("action"),
                 Interaction.created_at.label("created_at"),
                 func.row_number()
                 .over(
-                    partition_by=(Interaction.actor_user_id, Interaction.candidate_user_id),
+                    partition_by=(actor_id_column, candidate_id_column),
                     order_by=(Interaction.created_at.desc(), Interaction.id.desc()),
                 )
                 .label("row_number"),
@@ -78,12 +113,12 @@ class InteractionBlocklistService:
                 Interaction.deleted_at.is_(None),
                 or_(
                     (
-                        (Interaction.actor_user_id == actor_user_id)
-                        & Interaction.candidate_user_id.in_(candidate_user_ids)
+                        (actor_id_column == actor_user_id)
+                        & candidate_id_column.in_(candidate_user_ids)
                     ),
                     (
-                        (Interaction.candidate_user_id == actor_user_id)
-                        & Interaction.actor_user_id.in_(candidate_user_ids)
+                        (candidate_id_column == actor_user_id)
+                        & actor_id_column.in_(candidate_user_ids)
                     ),
                 ),
             )
@@ -132,3 +167,16 @@ def _is_reverse_blocked(action: str) -> bool:
 
 def _normalize_id(value: str | None) -> str | None:
     return normalize_user_id(value, allow_hash=False)
+
+
+def _is_uuid_varchar_operator_mismatch_error(error: DBAPIError) -> bool:
+    original_error = getattr(error, "orig", None)
+    sqlstate = str(
+        getattr(original_error, "sqlstate", None)
+        or getattr(original_error, "pgcode", None)
+        or ""
+    )
+    if sqlstate != "42883":
+        return False
+    message = str(original_error).lower()
+    return ("character varying" in message and "uuid" in message) or ("varchar" in message and "uuid" in message)
