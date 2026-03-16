@@ -4,7 +4,7 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any
 
-from ml.services.user_id import normalize_user_id
+from ml.services.user_id import normalize_user_id, normalize_uuid
 
 SUPPORTED_INTERACTION_ACTIONS = {
     "like",
@@ -66,7 +66,7 @@ def normalize_audit_event_row(event: Mapping[str, Any]) -> dict[str, Any] | None
     if actor_user_id is None or candidate_user_id is None or actor_user_id == candidate_user_id:
         return None
 
-    event_id = _normalize_string(event.get("id") or event.get("event_id"))
+    event_id = normalize_uuid(event.get("id") or event.get("event_id"))
     created_at_iso = _to_iso_datetime(event.get("created_at"))
     if event_id is None or created_at_iso is None:
         return None

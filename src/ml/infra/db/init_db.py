@@ -31,6 +31,16 @@ def init_db(force: bool = False) -> None:
             table.create(bind=engine, checkfirst=True)
 
         with engine.begin() as connection:
+            for table_name, column_name in (
+                ("user_interaction_features", "user_id"),
+                ("ml_recommendation_groups", "actor_user_id"),
+                ("ml_recommendation_impressions", "actor_user_id"),
+                ("ml_recommendation_impressions", "candidate_user_id"),
+                ("ml_recommendation_samples", "user_id"),
+                ("ml_recommendation_samples", "candidate_user_id"),
+            ):
+                _ensure_uuid_column(connection, table_name=table_name, column_name=column_name)
+
             connection.execute(
                 text(
                     """
@@ -120,6 +130,29 @@ def init_db(force: bool = False) -> None:
                 )
             )
         _SCHEMA_READY = True
+
+
+def _ensure_uuid_column(connection, *, table_name: str, column_name: str) -> None:
+    connection.execute(
+        text(
+            f"""
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = '{table_name}'
+                      AND column_name = '{column_name}'
+                      AND data_type <> 'uuid'
+                ) THEN
+                    EXECUTE 'ALTER TABLE {table_name} ALTER COLUMN {column_name} TYPE UUID USING {column_name}::uuid';
+                END IF;
+            END
+            $$;
+            """
+        )
+    )
 
 
 if __name__ == "__main__":

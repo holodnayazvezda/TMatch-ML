@@ -19,6 +19,7 @@ from ml.infra.db.models import (
 from ml.infra.db.session import SessionLocal
 from ml.services.interaction_ingestion import TRAINING_INTERACTION_ACTIONS
 from ml.services.recommendation_scoring import PREDICTION_COLUMN_BY_TARGET
+from ml.services.user_id import normalize_user_id
 
 GROUP_STATUS_PENDING = "pending"
 GROUP_STATUS_FINALIZED = "finalized"
@@ -66,7 +67,10 @@ def save_recommendation_group_in_session(
     if shown_timestamp is None:
         raise ValueError("shown_at must be a valid datetime")
 
-    normalized_actor_user_id = _normalize_required_string(actor_user_id, field_name="actor_user_id")
+    normalized_actor_user_id = _normalize_required_user_id(
+        actor_user_id,
+        field_name="actor_user_id",
+    )
     normalized_recommendation_id = _normalize_required_string(
         recommendation_id,
         field_name="ml_recommendation_id",
@@ -101,7 +105,7 @@ def save_recommendation_group_in_session(
 
     impression_payloads = []
     for recommendation_row in recommendation_rows:
-        candidate_user_id = _normalize_required_string(
+        candidate_user_id = _normalize_required_user_id(
             recommendation_row.get("candidate_user_id"),
             field_name="candidate_user_id",
         )
@@ -168,7 +172,10 @@ def run_with_user_recommendation_lock(
     poll_wait_seconds: float,
     callback: Callable[[Session], Any],
 ) -> Any:
-    normalized_actor_user_id = _normalize_required_string(actor_user_id, field_name="actor_user_id")
+    normalized_actor_user_id = _normalize_required_user_id(
+        actor_user_id,
+        field_name="actor_user_id",
+    )
     init_db()
 
     with SessionLocal() as session:
@@ -197,7 +204,10 @@ def get_pending_group_for_user(actor_user_id: str) -> dict[str, Any] | None:
 
 
 def get_pending_group_for_user_in_session(session: Session, actor_user_id: str) -> dict[str, Any] | None:
-    normalized_actor_user_id = _normalize_required_string(actor_user_id, field_name="actor_user_id")
+    normalized_actor_user_id = _normalize_required_user_id(
+        actor_user_id,
+        field_name="actor_user_id",
+    )
     stmt = (
         select(MLRecommendationGroup)
         .where(
@@ -454,11 +464,11 @@ def get_shown_candidate_ids(
 ) -> set[str]:
     init_db()
 
-    normalized_actor_user_id = _normalize_required_string(
+    normalized_actor_user_id = _normalize_required_user_id(
         actor_user_id,
         field_name="actor_user_id",
     )
-    normalized_candidate_ids = _normalize_non_empty_strings(candidate_user_ids or [])
+    normalized_candidate_ids = _normalize_non_empty_user_ids(candidate_user_ids or [])
     stmt = select(MLRecommendationImpression.candidate_user_id).where(
         MLRecommendationImpression.actor_user_id == normalized_actor_user_id,
     )
@@ -630,6 +640,13 @@ def _normalize_required_string(raw_value: Any, *, field_name: str) -> str:
     return normalized_value
 
 
+def _normalize_required_user_id(raw_value: Any, *, field_name: str) -> str:
+    normalized_value = normalize_user_id(raw_value, allow_hash=True)
+    if normalized_value is None:
+        raise ValueError(f"{field_name} must be a valid UUID.")
+    return normalized_value
+
+
 def _normalize_non_empty_strings(values: Iterable[Any]) -> list[str]:
     normalized_values: list[str] = []
     seen_values: set[str] = set()
@@ -638,6 +655,18 @@ def _normalize_non_empty_strings(values: Iterable[Any]) -> list[str]:
             continue
         normalized_value = str(raw_value).strip()
         if not normalized_value or normalized_value in seen_values:
+            continue
+        seen_values.add(normalized_value)
+        normalized_values.append(normalized_value)
+    return normalized_values
+
+
+def _normalize_non_empty_user_ids(values: Iterable[Any]) -> list[str]:
+    normalized_values: list[str] = []
+    seen_values: set[str] = set()
+    for raw_value in values:
+        normalized_value = normalize_user_id(raw_value, allow_hash=True)
+        if normalized_value is None or normalized_value in seen_values:
             continue
         seen_values.add(normalized_value)
         normalized_values.append(normalized_value)
