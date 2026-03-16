@@ -42,6 +42,20 @@ def process_interaction_batch(
     return summary
 
 
+def process_interaction_batch_in_session(
+    session: Session,
+    events: Sequence[dict[str, Any]],
+    *,
+    refresh_features: bool = True,
+) -> dict[str, int]:
+    summary, _ = _process_interaction_batch_with_session(
+        session,
+        events,
+        refresh_features=refresh_features,
+    )
+    return summary
+
+
 def refresh_user_features(user_ids: Iterable[str]) -> dict[str, int]:
     normalized_user_ids = _normalize_user_ids(user_ids)
     if not normalized_user_ids:
@@ -120,6 +134,22 @@ def _process_interaction_batch_internal(
     *,
     refresh_features: bool,
 ) -> tuple[dict[str, int], list[str]]:
+    init_db()
+    with SessionLocal() as session:
+        with session.begin():
+            return _process_interaction_batch_with_session(
+                session,
+                events,
+                refresh_features=refresh_features,
+            )
+
+
+def _process_interaction_batch_with_session(
+    session: Session,
+    events: Sequence[dict[str, Any]],
+    *,
+    refresh_features: bool,
+) -> tuple[dict[str, int], list[str]]:
     normalized_events = _normalize_storage_events(events)
     affected_user_ids = _collect_affected_user_ids(normalized_events)
 
@@ -135,19 +165,16 @@ def _process_interaction_batch_internal(
             [],
         )
 
-    init_db()
-    with SessionLocal() as session:
-        with session.begin():
-            _acquire_advisory_lock(session)
-            _upsert_interactions(session, normalized_events)
+    _acquire_advisory_lock(session)
+    _upsert_interactions(session, normalized_events)
 
-            refresh_summary = {
-                "refreshed_user_count": 0,
-                "upserted_feature_row_count": 0,
-                "deleted_feature_row_count": 0,
-            }
-            if refresh_features and affected_user_ids:
-                refresh_summary = _refresh_user_features_in_session(session, affected_user_ids)
+    refresh_summary = {
+        "refreshed_user_count": 0,
+        "upserted_feature_row_count": 0,
+        "deleted_feature_row_count": 0,
+    }
+    if refresh_features and affected_user_ids:
+        refresh_summary = _refresh_user_features_in_session(session, affected_user_ids)
 
     return (
         {

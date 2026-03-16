@@ -30,6 +30,23 @@ def init_db(force: bool = False) -> None:
             connection.execute(
                 text(
                     """
+                    CREATE TABLE IF NOT EXISTS audit_events (
+                        id VARCHAR PRIMARY KEY,
+                        created_at TIMESTAMPTZ NOT NULL,
+                        deleted_at TIMESTAMPTZ NULL,
+                        actor_user_id VARCHAR NULL,
+                        target_user_id VARCHAR NULL,
+                        payload JSONB NULL,
+                        ml_recommendation_id VARCHAR NULL,
+                        event_type VARCHAR NOT NULL,
+                        sent_to_ml BOOLEAN NOT NULL DEFAULT false
+                    )
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
                     CREATE INDEX IF NOT EXISTS ix_interactions_actor_user_id
                     ON interactions (actor_user_id)
                     """
@@ -70,8 +87,112 @@ def init_db(force: bool = False) -> None:
             connection.execute(
                 text(
                     """
+                    CREATE INDEX IF NOT EXISTS ix_interactions_ml_recommendation_id
+                    ON interactions (ml_recommendation_id)
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
                     CREATE INDEX IF NOT EXISTS ix_user_interaction_features_snapshot_at
                     ON user_interaction_features (snapshot_at)
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_ml_recommendation_samples_label_status
+                    ON ml_recommendation_samples (label_status)
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_ml_recommendation_samples_user_candidate
+                    ON ml_recommendation_samples (user_id, candidate_user_id)
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_ml_recommendation_samples_created_at
+                    ON ml_recommendation_samples (created_at)
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    ALTER TABLE ml_recommendation_groups
+                    ADD COLUMN IF NOT EXISTS served_stage VARCHAR(16) NOT NULL DEFAULT 'stage_4'
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_ml_recommendation_groups_actor_status_shown_at
+                    ON ml_recommendation_groups (actor_user_id, group_status, shown_at)
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_ml_recommendation_groups_served_stage
+                    ON ml_recommendation_groups (served_stage)
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_ml_recommendation_groups_shown_at
+                    ON ml_recommendation_groups (shown_at)
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_ml_recommendation_impressions_group_id
+                    ON ml_recommendation_impressions (ml_recommendation_id)
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_ml_recommendation_impressions_row_status_shown_at
+                    ON ml_recommendation_impressions (row_status, shown_at)
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_ml_recommendation_impressions_actor_candidate
+                    ON ml_recommendation_impressions (actor_user_id, candidate_user_id)
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_audit_events_sent_to_ml_created_at
+                    ON audit_events (sent_to_ml, created_at)
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_audit_events_ml_recommendation_id
+                    ON audit_events (ml_recommendation_id)
                     """
                 )
             )

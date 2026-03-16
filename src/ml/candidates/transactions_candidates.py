@@ -1,9 +1,12 @@
+import hashlib
+from pathlib import Path
 from dataclasses import dataclass
 from threading import Lock
 
 import faiss
 import numpy as np
 import pandas as pd
+import structlog
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import RobustScaler
 
@@ -12,7 +15,8 @@ from ml.explanation import get_reason_mapper_values
 from ml.infra.blocked_service import InteractionBlocklistService
 from ml.services.user_id import normalize_user_id
 
-DATA_PATH = Paths.out_data_path / "user_features_all_1000.csv"
+DATA_PARQUET_PATH = Paths.transaction_user_features_parquet_path
+DATA_CSV_PATH = Paths.transaction_user_features_csv_path
 ID_COLUMN = "party_rk"
 DATE_COLUMNS = ["first_txn_dttm", "last_txn_dttm"]
 TOP_CATEGORY_COLUMN = "top_cat_from_share"
@@ -28,6 +32,7 @@ _SEARCH_LOCK = Lock()
 _SEARCH_BUNDLE = None
 _INTERACTION_BLOCKLIST_SERVICE = InteractionBlocklistService()
 _MAPPER_REASON_VALUES = tuple(get_reason_mapper_values())
+log: structlog.BoundLogger = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -37,7 +42,7 @@ class CandidateConfig:
     topk_trans_sim: int = 150
     topk_inter_sim: int = 150
     trans_inter_rate: float = 0.5
-    an_impactful_features: int = 3
+    an_impactful_features: int = 6
 
 
 def infer_load_config(file_path, sample_rows=2000):
@@ -67,18 +72,65 @@ def infer_load_config(file_path, sample_rows=2000):
     return dtype_map, date_columns, categorical_columns
 
 
-def load_dataset(file_path):
-    dtype_map, date_columns, categorical_columns = infer_load_config(file_path)
+def resolve_dataset_path(
+    parquet_path: str | Path = DATA_PARQUET_PATH,
+    csv_path: str | Path | None = DATA_CSV_PATH,
+) -> Path:
+    parquet_candidate = Path(parquet_path)
+    if parquet_candidate.exists():
+        return parquet_candidate
 
-    df = pd.read_csv(
-        file_path,
-        dtype=dtype_map,
-        parse_dates=date_columns,
-        low_memory=False,
+    if csv_path is not None:
+        csv_candidate = Path(csv_path)
+        if csv_candidate.exists():
+            return csv_candidate
+
+    raise FileNotFoundError(
+        f"User feature dataset not found. Checked parquet={parquet_candidate} csv={csv_path}."
     )
 
-    for column in categorical_columns:
-        df[column] = df[column].astype("string")
+
+def load_dataset(file_path: str | Path | None = None):
+    resolved_path = Path(file_path) if file_path is not None else resolve_dataset_path()
+    suffix = resolved_path.suffix.lower()
+
+    if suffix == ".parquet":
+        try:
+            df = pd.read_parquet(resolved_path)
+        except ImportError as exc:
+            csv_fallback_path = Path(DATA_CSV_PATH)
+            if not csv_fallback_path.exists():
+                raise
+            log.warning(
+                "transaction_candidates_parquet_engine_missing_falling_back_to_csv",
+                parquet_path=str(resolved_path),
+                csv_fallback_path=str(csv_fallback_path),
+                error=str(exc),
+            )
+            dtype_map, date_columns, categorical_columns = infer_load_config(csv_fallback_path)
+            df = pd.read_csv(
+                csv_fallback_path,
+                dtype=dtype_map,
+                parse_dates=date_columns,
+                low_memory=False,
+            )
+
+            for column in categorical_columns:
+                df[column] = df[column].astype("string")
+    else:
+        dtype_map, date_columns, categorical_columns = infer_load_config(resolved_path)
+
+        df = pd.read_csv(
+            resolved_path,
+            dtype=dtype_map,
+            parse_dates=date_columns,
+            low_memory=False,
+        )
+
+        for column in categorical_columns:
+            df[column] = df[column].astype("string")
+
+    df = _coerce_date_columns(df)
 
     df[ID_COLUMN] = df[ID_COLUMN].map(lambda raw_id: normalize_user_id(raw_id, allow_hash=True)).astype("string")
     df = df[df[ID_COLUMN].notna()].copy()
@@ -86,26 +138,58 @@ def load_dataset(file_path):
     return df
 
 
-def add_date_features(df):
+def _coerce_date_columns(df, date_columns=None):
     result = df.copy()
-    available_date_columns = [column for column in DATE_COLUMNS if column in result.columns]
+    for column in _get_available_date_columns(result, date_columns=date_columns):
+        result[column] = pd.to_datetime(result[column], errors="coerce", utc=False)
+    return result
+
+
+def _get_available_date_columns(df, date_columns=None):
+    candidate_columns = DATE_COLUMNS if date_columns is None else list(date_columns)
+    available_date_columns = []
+    for column in candidate_columns:
+        if column not in df.columns:
+            continue
+        series = df[column]
+        if pd.api.types.is_datetime64_any_dtype(series):
+            available_date_columns.append(column)
+            continue
+        coerced_series = pd.to_datetime(series, errors="coerce", utc=False)
+        if coerced_series.notna().any():
+            available_date_columns.append(column)
+    return available_date_columns
+
+
+def add_date_features(df, date_columns=None):
+    result = df.copy()
+    available_date_columns = _get_available_date_columns(result, date_columns=date_columns)
 
     if not available_date_columns:
         return result
 
+    result = _coerce_date_columns(result, date_columns=available_date_columns)
     reference_date = max(result[column].max() for column in available_date_columns)
 
-    if "first_txn_dttm" in result.columns:
+    if reference_date is pd.NaT or reference_date is None:
+        return result
+
+    for column in available_date_columns:
+        result[f"days_since_{column}"] = (
+            reference_date - result[column]
+        ).dt.days.astype("float32")
+
+    if "first_txn_dttm" in available_date_columns:
         result["days_since_first_txn"] = (
             reference_date - result["first_txn_dttm"]
         ).dt.days.astype("float32")
 
-    if "last_txn_dttm" in result.columns:
+    if "last_txn_dttm" in available_date_columns:
         result["days_since_last_txn"] = (
             reference_date - result["last_txn_dttm"]
         ).dt.days.astype("float32")
 
-    if {"first_txn_dttm", "last_txn_dttm"}.issubset(result.columns):
+    if {"first_txn_dttm", "last_txn_dttm"}.issubset(available_date_columns):
         result["activity_length_days"] = (
             result["last_txn_dttm"] - result["first_txn_dttm"]
         ).dt.days.astype("float32")
@@ -152,12 +236,12 @@ def add_interpretable_share_columns(df):
     return result
 
 
-def prepare_search_artifacts(df):
-    enriched_df = add_date_features(df)
+def prepare_search_artifacts(df, date_columns=None):
+    enriched_df = add_date_features(df, date_columns=date_columns)
     enriched_df = enriched_df[enriched_df[ID_COLUMN].notna()].copy().reset_index(drop=True)
     output_df = add_interpretable_share_columns(enriched_df).reset_index(drop=True)
 
-    available_date_columns = [column for column in DATE_COLUMNS if column in enriched_df.columns]
+    available_date_columns = _get_available_date_columns(enriched_df, date_columns=date_columns)
     model_df = enriched_df.drop(columns=available_date_columns).copy()
 
     categorical_columns = []
@@ -332,7 +416,7 @@ def _get_search_bundle(search_bundle=None, config=None):
 
     with _SEARCH_LOCK:
         if _SEARCH_BUNDLE is None:
-            df = load_dataset(DATA_PATH)
+            df = load_dataset()
             bundle = prepare_search_artifacts(df)
             bundle["faiss_index"] = build_faiss_index(
                 bundle["scaled_matrix"],
@@ -404,6 +488,28 @@ def _extract_random_impactful_features(feature_names, top_k):
     sample_size = min(int(top_k), len(_MAPPER_REASON_VALUES))
     sampled_reasons = np.random.choice(_MAPPER_REASON_VALUES, size=sample_size, replace=False)
     random_impacts = np.random.uniform(0.2, 0.9, size=sample_size)
+
+    return {
+        str(reason_code): round(float(impact), 4)
+        for reason_code, impact in zip(sampled_reasons, random_impacts)
+    }
+
+
+def _extract_seeded_impactful_features(seed_value, top_k):
+    if top_k <= 0:
+        return {}
+    if not _MAPPER_REASON_VALUES:
+        return {}
+
+    sample_size = min(int(top_k), len(_MAPPER_REASON_VALUES))
+    if sample_size <= 0:
+        return {}
+
+    digest = hashlib.blake2b(str(seed_value).encode("utf-8"), digest_size=8).digest()
+    seed = int.from_bytes(digest, byteorder="big", signed=False)
+    random_generator = np.random.default_rng(seed)
+    sampled_reasons = random_generator.choice(_MAPPER_REASON_VALUES, size=sample_size, replace=False)
+    random_impacts = np.linspace(0.65, 0.25, num=sample_size, dtype=float)
 
     return {
         str(reason_code): round(float(impact), 4)
