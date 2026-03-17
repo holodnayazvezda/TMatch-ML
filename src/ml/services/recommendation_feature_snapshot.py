@@ -248,6 +248,8 @@ def _extract_source_provenance(source_row: dict[str, Any]) -> dict[str, Any]:
         "from_interaction": bool(from_interaction),
         "from_exotic": bool(from_exotic),
         "from_popularity": bool(from_popularity),
+        "impactful_features_origin": source_row.get("impactful_features_origin"),
+        "impactful_features_seed_basis": source_row.get("impactful_features_seed_basis"),
         "retrieval_primary_source": source_row.get("retrieval_primary_source") or inferred_primary_source,
         "retrieval_sources_count": _first_int(source_row.get("retrieval_sources_count")),
         "retrieval_sources": source_row.get("retrieval_sources"),

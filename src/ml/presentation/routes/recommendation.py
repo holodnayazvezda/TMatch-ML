@@ -6,7 +6,6 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 import structlog
-
 from ml.config import settings
 from ml.services.recommendation_identity import generate_recommendation_id
 from ml.services.recommendation_runtime_config import (

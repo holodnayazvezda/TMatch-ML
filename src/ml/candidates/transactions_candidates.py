@@ -1,4 +1,5 @@
 import hashlib
+import pickle
 from pathlib import Path
 from dataclasses import dataclass
 from threading import Lock
@@ -13,10 +14,13 @@ from sklearn.preprocessing import RobustScaler
 from core.data_config import Paths
 from ml.explanation import get_reason_mapper_values
 from ml.infra.blocked_service import InteractionBlocklistService
+from ml.services.serving_policy import is_lazy_rebuild_allowed_in_serving, log_lazy_rebuild_blocked
 from ml.services.user_id import normalize_user_id
 
 DATA_PARQUET_PATH = Paths.transaction_user_features_parquet_path
 DATA_CSV_PATH = Paths.transaction_user_features_csv_path
+SEARCH_BUNDLE_PATH = Paths.transaction_search_bundle_path
+INDEX_PATH = Paths.transaction_hnsw_index_path
 ID_COLUMN = "party_rk"
 DATE_COLUMNS = ["first_txn_dttm", "last_txn_dttm"]
 TOP_CATEGORY_COLUMN = "top_cat_from_share"
@@ -403,10 +407,12 @@ def _resolve_user_id(user_or_conf):
 def _get_search_bundle(search_bundle=None, config=None):
     if search_bundle is not None:
         if "faiss_index" not in search_bundle:
-            search_bundle["faiss_index"] = build_faiss_index(
-                search_bundle["scaled_matrix"],
-                config or CandidateConfig(),
+            log_lazy_rebuild_blocked(
+                source="transactions",
+                reason="search_bundle_missing_faiss_index",
+                artifact_path=SEARCH_BUNDLE_PATH,
             )
+            return None
         _ensure_cluster_artifacts(search_bundle, config=config or CandidateConfig())
         return search_bundle
 
@@ -416,22 +422,65 @@ def _get_search_bundle(search_bundle=None, config=None):
 
     with _SEARCH_LOCK:
         if _SEARCH_BUNDLE is None:
-            df = load_dataset()
-            bundle = prepare_search_artifacts(df)
-            bundle["faiss_index"] = build_faiss_index(
-                bundle["scaled_matrix"],
-                config or CandidateConfig(),
-            )
-            bundle.update(build_cluster_artifacts(bundle["scaled_matrix"], config=config or CandidateConfig()))
-            _SEARCH_BUNDLE = bundle
+            _SEARCH_BUNDLE = _load_prebuilt_search_bundle()
 
     return _SEARCH_BUNDLE
 
 
 def warmup_search_bundle(config=None):
-    """Build and cache search artifacts, HNSW index and cluster artifacts once per process."""
-    effective_config = _to_candidate_config(config)
-    return _get_search_bundle(search_bundle=None, config=effective_config)
+    """Load and cache prebuilt search artifacts once per process."""
+    _ = _to_candidate_config(config)
+    bundle = _get_search_bundle(search_bundle=None, config=config)
+    if bundle is None:
+        status_payload = get_search_bundle_artifact_status()
+        log.warning("transaction_candidates_warmup_degraded", **status_payload)
+        return None
+    return bundle
+
+
+def get_search_bundle_artifact_status() -> dict[str, object]:
+    bundle_path = Path(SEARCH_BUNDLE_PATH)
+    index_path = Path(INDEX_PATH)
+    if not bundle_path.exists() or not index_path.exists():
+        return {
+            "source": "transactions",
+            "status": "missing",
+            "bundle_path": str(bundle_path),
+            "index_path": str(index_path),
+        }
+
+    try:
+        with bundle_path.open("rb") as input_stream:
+            payload = pickle.load(input_stream)
+    except Exception as exc:
+        return {
+            "source": "transactions",
+            "status": "invalid",
+            "bundle_path": str(bundle_path),
+            "index_path": str(index_path),
+            "error": str(exc),
+        }
+
+    row_count = int(payload.get("output_df", pd.DataFrame()).shape[0])
+    latest_mtime = max(float(bundle_path.stat().st_mtime), float(index_path.stat().st_mtime))
+    artifact_age_seconds = max(0.0, pd.Timestamp.utcnow().timestamp() - latest_mtime)
+    return {
+        "source": "transactions",
+        "status": "ready",
+        "bundle_path": str(bundle_path),
+        "index_path": str(index_path),
+        "row_count": row_count,
+        "artifact_age_seconds": round(artifact_age_seconds, 3),
+    }
+
+
+def reload_prebuilt_search_bundle() -> dict[str, object]:
+    global _SEARCH_BUNDLE
+    with _SEARCH_LOCK:
+        _SEARCH_BUNDLE = _load_prebuilt_search_bundle()
+    status_payload = get_search_bundle_artifact_status()
+    status_payload["in_memory_ready"] = bool(_SEARCH_BUNDLE is not None)
+    return status_payload
 
 
 def _ensure_cluster_artifacts(search_bundle, config=None):
@@ -445,13 +494,107 @@ def _ensure_cluster_artifacts(search_bundle, config=None):
     if required_keys.issubset(search_bundle):
         return search_bundle
 
-    search_bundle.update(
-        build_cluster_artifacts(
-            search_bundle["scaled_matrix"],
-            config=config or CandidateConfig(),
+    if is_lazy_rebuild_allowed_in_serving():
+        search_bundle.update(
+            build_cluster_artifacts(
+                search_bundle["scaled_matrix"],
+                config=config or CandidateConfig(),
+            )
         )
+        return search_bundle
+
+    feature_count = int(search_bundle.get("scaled_matrix", np.empty((0, 0))).shape[1]) if getattr(
+        search_bundle.get("scaled_matrix"),
+        "ndim",
+        0,
+    ) == 2 else 0
+    search_bundle.update(_build_empty_cluster_artifacts(feature_count=feature_count))
+    log_lazy_rebuild_blocked(
+        source="transactions",
+        reason="cluster_artifacts_missing",
+        artifact_path=SEARCH_BUNDLE_PATH,
     )
     return search_bundle
+
+
+def _load_prebuilt_search_bundle() -> dict[str, object] | None:
+    bundle_path = Path(SEARCH_BUNDLE_PATH)
+    index_path = Path(INDEX_PATH)
+    if not bundle_path.exists():
+        log_lazy_rebuild_blocked(
+            source="transactions",
+            reason="prebuilt_bundle_missing",
+            artifact_path=bundle_path,
+        )
+        return None
+    if not index_path.exists():
+        log_lazy_rebuild_blocked(
+            source="transactions",
+            reason="prebuilt_index_missing",
+            artifact_path=index_path,
+        )
+        return None
+
+    try:
+        with bundle_path.open("rb") as input_stream:
+            bundle = pickle.load(input_stream)
+    except Exception as exc:
+        log.warning(
+            "transaction_candidates_bundle_load_failed",
+            bundle_path=str(bundle_path),
+            error=str(exc),
+        )
+        return None
+
+    required_fields = {"output_df", "feature_names", "scaled_matrix", "user_ids", "id_index"}
+    if not required_fields.issubset(bundle):
+        missing_fields = sorted(required_fields.difference(bundle))
+        log.warning(
+            "transaction_candidates_bundle_invalid",
+            bundle_path=str(bundle_path),
+            missing_fields=missing_fields,
+        )
+        return None
+
+    try:
+        index = faiss.read_index(str(index_path))
+    except Exception as exc:
+        log.warning(
+            "transaction_candidates_index_load_failed",
+            index_path=str(index_path),
+            error=str(exc),
+        )
+        return None
+
+    scaled_matrix = np.asarray(bundle["scaled_matrix"])
+    feature_count = int(scaled_matrix.shape[1]) if scaled_matrix.ndim == 2 else 0
+    if feature_count <= 0:
+        return None
+    if int(index.d) != feature_count or int(index.ntotal) != int(scaled_matrix.shape[0]):
+        log.warning(
+            "transaction_candidates_index_shape_mismatch",
+            index_path=str(index_path),
+            index_dim=int(index.d),
+            feature_count=feature_count,
+            index_size=int(index.ntotal),
+            row_count=int(scaled_matrix.shape[0]),
+        )
+        return None
+
+    bundle["faiss_index"] = index
+    _ensure_cluster_artifacts(bundle, config=CandidateConfig())
+    return bundle
+
+
+def _build_empty_cluster_artifacts(*, feature_count: int) -> dict[str, object]:
+    empty_assignments = np.asarray([], dtype=np.int32)
+    return {
+        "cluster_count": 0,
+        "cluster_assignments": empty_assignments,
+        "cluster_member_indices": {},
+        "cluster_order": empty_assignments,
+        "cluster_centroids": np.empty((0, max(0, int(feature_count))), dtype=np.float32),
+    }
 
 
 def _extract_impactful_features(query_vector, candidate_vector, feature_names, top_k):
@@ -523,6 +666,8 @@ def get_transaction_candidates(user_id, config=CandidateConfig(), search_bundle=
     effective_config = _to_candidate_config(request_object if hasattr(request_object, "user_id") else config)
 
     search_bundle = _get_search_bundle(search_bundle=search_bundle, config=effective_config)
+    if not search_bundle:
+        return pd.DataFrame()
     id_index = search_bundle["id_index"]
     user_ids = search_bundle["user_ids"]
     scaled_matrix = search_bundle["scaled_matrix"]
@@ -618,6 +763,8 @@ def get_transaction_candidates(user_id, config=CandidateConfig(), search_bundle=
     result_df.insert(1, "distance_euclidean", top_distances.astype(float))
     result_df.insert(2, "query_party_rk", query_user_id)
     result_df.insert(3, "impactful_features", impactful_features)
+    result_df["impactful_features_origin"] = "vector_distance_contribution"
+    result_df["impactful_features_seed_basis"] = None
 
     return result_df
 

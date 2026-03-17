@@ -23,6 +23,8 @@ dependencies = [
 [project.scripts]
 api = "ml.presentation.main:run"
 train-models = "ml.services.model_training:run"
+build-offline-artifacts = "ml.services.offline_artifacts:run"
+check-offline-artifacts-ready = "ml.services.artifact_readiness:run_check_cli"
 
 [build-system]
 requires = ["hatchling"]

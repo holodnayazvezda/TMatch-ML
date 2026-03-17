@@ -233,18 +233,14 @@ def _prepare_source_frame(
         index=source_df.index,
     )
 
-    feature_columns_to_skip = {
-        QUERY_ID_COLUMN,
-        CANDIDATE_ID_COLUMN,
-        candidate_id_col,
-        source_query_column,
-        source_rank_column,
-        "_source_rank",
-    }
-    feature_columns = [column for column in source_df.columns if column not in feature_columns_to_skip]
-    if feature_columns:
-        feature_frame = source_df[feature_columns].copy()
-        feature_frame.columns = [f"retrieval_{source_name}_feature_{column}" for column in feature_columns]
+    source_feature_columns = [
+        column
+        for column in ("impactful_features", "impactful_features_origin", "impactful_features_seed_basis")
+        if column in source_df.columns
+    ]
+    if source_feature_columns:
+        feature_frame = source_df[source_feature_columns].copy()
+        feature_frame.columns = [f"retrieval_{source_name}_feature_{column}" for column in source_feature_columns]
         result = pd.concat(
             [base_frame, retrieval_flags_frame, feature_frame],
             axis=1,
@@ -313,15 +309,23 @@ def _add_common_retrieval_features(merged: pd.DataFrame, source_names: list[str]
     merged["rank"] = merged["retrieval_best_rank"]
     merged["distance_euclidean"] = np.nan
     merged["impactful_features"] = None
+    merged["impactful_features_origin"] = None
+    merged["impactful_features_seed_basis"] = None
 
     for source_name in source_names:
         source_mask = merged["retrieval_primary_source"] == source_name
         source_score_column = f"retrieval_{source_name}_score"
         source_impactful_column = f"retrieval_{source_name}_feature_impactful_features"
+        source_impactful_origin_column = f"retrieval_{source_name}_feature_impactful_features_origin"
+        source_impactful_seed_column = f"retrieval_{source_name}_feature_impactful_features_seed_basis"
         if source_score_column in merged.columns:
             merged.loc[source_mask, "distance_euclidean"] = merged.loc[source_mask, source_score_column]
         if source_impactful_column in merged.columns:
             merged.loc[source_mask, "impactful_features"] = merged.loc[source_mask, source_impactful_column]
+        if source_impactful_origin_column in merged.columns:
+            merged.loc[source_mask, "impactful_features_origin"] = merged.loc[source_mask, source_impactful_origin_column]
+        if source_impactful_seed_column in merged.columns:
+            merged.loc[source_mask, "impactful_features_seed_basis"] = merged.loc[source_mask, source_impactful_seed_column]
 
     return merged
 

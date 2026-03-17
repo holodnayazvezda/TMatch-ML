@@ -3,8 +3,8 @@ from pathlib import Path
 
 import polars as pl
 
-from src.core.data_config import Paths
-from src.ml.services.user_id import normalize_user_id
+from core.data_config import Paths
+from ml.services.user_id import normalize_user_id
 
 PATHS = Paths()
 
@@ -152,8 +152,13 @@ def validate_inputs() -> list[Path]:
     return csv_files
 
 
-def build_tx_layer(csv_files: list[Path]) -> None:
-    if TX_LAYER_PATH.exists() and not REBUILD_TX_LAYER:
+def build_tx_layer(
+    csv_files: list[Path],
+    *,
+    tx_layer_path: Path = TX_LAYER_PATH,
+    rebuild_tx_layer: bool = REBUILD_TX_LAYER,
+) -> None:
+    if tx_layer_path.exists() and not rebuild_tx_layer:
         return
 
     raw_lf = pl.scan_csv(
@@ -197,7 +202,7 @@ def build_tx_layer(csv_files: list[Path]) -> None:
         pl.col("real_transaction_dttm").dt.weekday().cast(pl.Int8).alias("weekday_num"),
     )
 
-    sink_parquet(TX_LAYER_PATH, tx_layer_lf)
+    sink_parquet(tx_layer_path, tx_layer_lf)
 
 
 def get_top_buckets(tx_lf: pl.LazyFrame):
@@ -447,59 +452,77 @@ def build_merchant_features_lf(tx_lf: pl.LazyFrame) -> pl.LazyFrame:
     )
 
 
-def build_feature_stages(tx_lf: pl.LazyFrame) -> None:
+def build_feature_stages(
+    tx_lf: pl.LazyFrame,
+    *,
+    base_features_path: Path = BASE_FEATURES_PATH,
+    daily_features_path: Path = DAILY_FEATURES_PATH,
+    category_features_path: Path = CATEGORY_FEATURES_PATH,
+    mcc_features_path: Path = MCC_FEATURES_PATH,
+    merchant_features_path: Path = MERCHANT_FEATURES_PATH,
+    rebuild_feature_stages: bool = REBUILD_FEATURE_STAGES,
+) -> None:
     top_category_values, top_mcc_values, mcc_bucket_values, category_share_name_map, mcc_share_name_map = get_top_buckets(tx_lf)
 
     sink_parquet_stage(
-        BASE_FEATURES_PATH,
+        base_features_path,
         build_base_activity_lf(tx_lf),
-        rebuild=REBUILD_FEATURE_STAGES,
+        rebuild=rebuild_feature_stages,
     )
 
     sink_parquet_stage(
-        DAILY_FEATURES_PATH,
+        daily_features_path,
         build_daily_features_lf(tx_lf),
-        rebuild=REBUILD_FEATURE_STAGES,
+        rebuild=rebuild_feature_stages,
     )
 
     sink_parquet_stage(
-        CATEGORY_FEATURES_PATH,
+        category_features_path,
         build_category_features_lf(
             tx_lf=tx_lf,
             top_category_values=top_category_values,
             category_share_name_map=category_share_name_map,
         ),
-        rebuild=REBUILD_FEATURE_STAGES,
+        rebuild=rebuild_feature_stages,
     )
 
     sink_parquet_stage(
-        MCC_FEATURES_PATH,
+        mcc_features_path,
         build_mcc_features_lf(
             tx_lf=tx_lf,
             top_mcc_values=top_mcc_values,
             mcc_bucket_values=mcc_bucket_values,
             mcc_share_name_map=mcc_share_name_map,
         ),
-        rebuild=REBUILD_FEATURE_STAGES,
+        rebuild=rebuild_feature_stages,
     )
 
     sink_parquet_stage(
-        MERCHANT_FEATURES_PATH,
+        merchant_features_path,
         build_merchant_features_lf(tx_lf),
-        rebuild=REBUILD_FEATURE_STAGES,
+        rebuild=rebuild_feature_stages,
     )
 
 
-def assemble_final_dataset() -> None:
-    if FINAL_PARQUET_PATH.exists() and not REBUILD_FINAL_DATASET:
+def assemble_final_dataset(
+    *,
+    final_parquet_path: Path = FINAL_PARQUET_PATH,
+    base_features_path: Path = BASE_FEATURES_PATH,
+    daily_features_path: Path = DAILY_FEATURES_PATH,
+    category_features_path: Path = CATEGORY_FEATURES_PATH,
+    mcc_features_path: Path = MCC_FEATURES_PATH,
+    merchant_features_path: Path = MERCHANT_FEATURES_PATH,
+    rebuild_final_dataset: bool = REBUILD_FINAL_DATASET,
+) -> None:
+    if final_parquet_path.exists() and not rebuild_final_dataset:
         return
 
     final_lf = (
-        pl.scan_parquet(BASE_FEATURES_PATH)
-        .join(pl.scan_parquet(DAILY_FEATURES_PATH), on="party_rk", how="left")
-        .join(pl.scan_parquet(CATEGORY_FEATURES_PATH), on="party_rk", how="left")
-        .join(pl.scan_parquet(MCC_FEATURES_PATH), on="party_rk", how="left")
-        .join(pl.scan_parquet(MERCHANT_FEATURES_PATH), on="party_rk", how="left")
+        pl.scan_parquet(base_features_path)
+        .join(pl.scan_parquet(daily_features_path), on="party_rk", how="left")
+        .join(pl.scan_parquet(category_features_path), on="party_rk", how="left")
+        .join(pl.scan_parquet(mcc_features_path), on="party_rk", how="left")
+        .join(pl.scan_parquet(merchant_features_path), on="party_rk", how="left")
         .with_columns(
             weekday_name_expr("dominant_weekday_num", "dominant_weekday"),
             pl.when(pl.col("txn_cnt") > 0).then(pl.col("unique_merchant_cnt") / pl.col("txn_cnt")).otherwise(0.0).alias("merchant_diversity_ratio"),
@@ -508,7 +531,7 @@ def assemble_final_dataset() -> None:
         )
     )
 
-    sink_parquet(FINAL_PARQUET_PATH, final_lf)
+    sink_parquet(final_parquet_path, final_lf)
 
 
 def validate_final_dataset(user_features_pl: pl.DataFrame) -> None:
@@ -541,30 +564,92 @@ def validate_final_dataset(user_features_pl: pl.DataFrame) -> None:
             raise ValueError(f"Final dataset validation failed: {check_name}")
 
 
-def save_final_outputs(user_features_pl: pl.DataFrame) -> None:
-    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-    user_features_pl.write_parquet(FINAL_PARQUET_PATH)
-    user_features_pl.write_csv(FINAL_CSV_PATH)
+def save_final_outputs(
+    user_features_pl: pl.DataFrame,
+    *,
+    final_parquet_path: Path = FINAL_PARQUET_PATH,
+    final_csv_path: Path = FINAL_CSV_PATH,
+) -> None:
+    final_parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    final_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    user_features_pl.write_parquet(final_parquet_path)
+    user_features_pl.write_csv(final_csv_path)
+
+
+def build_unique_user_ids_frame(user_features_pl: pl.DataFrame) -> pl.DataFrame:
+    return (
+        user_features_pl
+        .select(pl.col("party_rk").alias("user_id"))
+        .drop_nulls()
+        .unique()
+        .sort("user_id")
+    )
+
+
+def run_pipeline(
+    *,
+    intermediate_dir: Path = INTERMEDIATE_DIR,
+    features_dir: Path = FEATURES_DIR,
+    tx_layer_path: Path = TX_LAYER_PATH,
+    base_features_path: Path = BASE_FEATURES_PATH,
+    daily_features_path: Path = DAILY_FEATURES_PATH,
+    category_features_path: Path = CATEGORY_FEATURES_PATH,
+    mcc_features_path: Path = MCC_FEATURES_PATH,
+    merchant_features_path: Path = MERCHANT_FEATURES_PATH,
+    final_parquet_path: Path = FINAL_PARQUET_PATH,
+    final_csv_path: Path = FINAL_CSV_PATH,
+    rebuild_tx_layer: bool = REBUILD_TX_LAYER,
+    rebuild_feature_stages: bool = REBUILD_FEATURE_STAGES,
+    rebuild_final_dataset: bool = REBUILD_FINAL_DATASET,
+) -> pl.DataFrame:
+    final_parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    intermediate_dir.mkdir(parents=True, exist_ok=True)
+    features_dir.mkdir(parents=True, exist_ok=True)
+
+    csv_files = validate_inputs()
+    build_tx_layer(
+        csv_files,
+        tx_layer_path=tx_layer_path,
+        rebuild_tx_layer=rebuild_tx_layer,
+    )
+
+    tx_lf = pl.scan_parquet(tx_layer_path)
+    build_feature_stages(
+        tx_lf,
+        base_features_path=base_features_path,
+        daily_features_path=daily_features_path,
+        category_features_path=category_features_path,
+        mcc_features_path=mcc_features_path,
+        merchant_features_path=merchant_features_path,
+        rebuild_feature_stages=rebuild_feature_stages,
+    )
+    assemble_final_dataset(
+        final_parquet_path=final_parquet_path,
+        base_features_path=base_features_path,
+        daily_features_path=daily_features_path,
+        category_features_path=category_features_path,
+        mcc_features_path=mcc_features_path,
+        merchant_features_path=merchant_features_path,
+        rebuild_final_dataset=rebuild_final_dataset,
+    )
+
+    user_features_pl = pl.read_parquet(final_parquet_path)
+    validate_final_dataset(user_features_pl)
+    save_final_outputs(
+        user_features_pl,
+        final_parquet_path=final_parquet_path,
+        final_csv_path=final_csv_path,
+    )
+    return user_features_pl
 
 
 def run() -> None:
-    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-    INTERMEDIATE_DIR.mkdir(parents=True, exist_ok=True)
-    FEATURES_DIR.mkdir(parents=True, exist_ok=True)
-
-    csv_files = validate_inputs()
-    build_tx_layer(csv_files)
-
-    tx_lf = pl.scan_parquet(TX_LAYER_PATH)
-    build_feature_stages(tx_lf)
-    assemble_final_dataset()
-
-    user_features_pl = pl.read_parquet(FINAL_PARQUET_PATH)
-    validate_final_dataset(user_features_pl)
-    save_final_outputs(user_features_pl)
+    user_features_pl = run_pipeline()
 
     print(f"Parquet saved to: {FINAL_PARQUET_PATH.resolve()}")
     print(f"CSV saved to: {FINAL_CSV_PATH.resolve()}")
+    user_ids_pl = build_unique_user_ids_frame(user_features_pl)
+    print(f"User ids prepared: {user_ids_pl.height}")
 
 
 if __name__ == "__main__":

@@ -525,6 +525,8 @@ def _build_feature_snapshot(source_row_json: dict[str, Any]) -> dict[str, Any]:
             "from_interaction": bool(source_row_json.get("retrieval_tx_interaction_is_candidate", 0)),
             "from_exotic": bool(source_row_json.get("retrieval_exotic_is_candidate", 0)),
             "from_popularity": bool(source_row_json.get("retrieval_popularity_is_candidate", 0)),
+            "impactful_features_origin": source_row_json.get("impactful_features_origin"),
+            "impactful_features_seed_basis": source_row_json.get("impactful_features_seed_basis"),
             "retrieval_primary_source": source_row_json.get("retrieval_primary_source"),
             "retrieval_sources_count": source_row_json.get("retrieval_sources_count"),
             "retrieval_sources": source_row_json.get("retrieval_sources"),

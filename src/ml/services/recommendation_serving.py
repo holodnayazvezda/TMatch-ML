@@ -511,6 +511,8 @@ def _has_transaction_profile(user_id: str) -> bool:
         bundle = transactions_candidates.warmup_search_bundle()
     except Exception:
         return False
+    if not bundle:
+        return False
     return user_id in bundle["id_index"]
 
 
