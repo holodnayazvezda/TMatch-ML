@@ -331,15 +331,6 @@ def _apply_targeting_filters(
     before_count = int(candidate_df.shape[0])
     after_count = int(result.shape[0])
     removed_count = before_count - after_count
-    if before_count > 0 and after_count == 0:
-        log.warning(
-            "recommendation_targeting_filter_degraded",
-            actor_user_id=actor_user_id,
-            before_count=before_count,
-            removed_count=removed_count,
-            degraded_mode="all_removed_fail_open",
-        )
-        return candidate_df.reset_index(drop=True)
     if removed_count > 0:
         log.info(
             "recommendation_targeting_filter_applied",
@@ -422,11 +413,16 @@ def _fallback_if_needed(
 ) -> pd.DataFrame:
     from ml.candidates import exotic_candidates, popularity_fallback, transactions_candidates
 
-    result = _dedupe_candidates(candidate_df)
+    result = _exclude_already_shown_candidates(_dedupe_candidates(candidate_df))
     if _count_fresh_candidates(result) >= int(top_n):
         return result
 
-    fallback_conf = _build_fallback_conf(conf, top_n=top_n)
+    candidate_pool_size = _get_offline_candidate_pool_size(actor_user_id=user_id)
+    fallback_conf = _build_fallback_conf(
+        conf,
+        top_n=top_n,
+        candidate_pool_size=candidate_pool_size,
+    )
     fallback_sequence = []
     if has_transaction_profile:
         fallback_sequence.append(("transactions", transactions_candidates.get_transaction_candidates))
@@ -453,6 +449,8 @@ def _fallback_if_needed(
         post_reason_count = int(fallback_df.shape[0])
         fallback_df = _annotate_shown_history(fallback_df, actor_user_id=user_id)
         post_shown_count = int(fallback_df.shape[0])
+        fallback_df = _exclude_already_shown_candidates(fallback_df)
+        post_fresh_only_count = int(fallback_df.shape[0])
         result = _dedupe_candidates(pd.concat([result, fallback_df], ignore_index=True))
         log.info(
             "recommendation_fallback_applied",
@@ -465,8 +463,10 @@ def _fallback_if_needed(
             post_hard_filters_count=post_hard_filters_count,
             post_reason_count=post_reason_count,
             post_shown_count=post_shown_count,
+            post_fresh_only_count=post_fresh_only_count,
             current_count=int(result.shape[0]),
             current_fresh_count=_count_fresh_candidates(result),
+            candidate_pool_size=candidate_pool_size,
         )
     return result
 
@@ -501,6 +501,95 @@ def _return_top_n(
             total_candidate_count=int(deduped_df.shape[0]),
         )
     return result_df
+
+
+def get_recommendation_cycle_state(
+    *,
+    actor_user_id: str,
+    stage: RecommendationStage,
+    targeting_profile_cache: dict[str, UserTargetingProfile] | None = None,
+) -> dict[str, int | bool]:
+    pool_candidate_ids = _get_offline_candidate_ids(actor_user_id=actor_user_id)
+    total_pool_count = len(pool_candidate_ids)
+    if total_pool_count <= 0:
+        payload = {
+            "is_exhausted": False,
+            "total_pool_count": 0,
+            "eligible_pool_count": 0,
+            "shown_eligible_count": 0,
+        }
+        log.info(
+            "recommendation_cycle_exhaustion_evaluated",
+            actor_user_id=actor_user_id,
+            stage=stage.value,
+            **payload,
+        )
+        return payload
+
+    pool_df = pd.DataFrame({"candidate_id": sorted(pool_candidate_ids)})
+    eligible_df = _apply_hard_filters(
+        pool_df,
+        actor_user_id=actor_user_id,
+        targeting_profile_cache=targeting_profile_cache,
+    )
+    eligible_candidate_ids = (
+        eligible_df.get("candidate_id", pd.Series(dtype="string"))
+        .dropna()
+        .astype("string")
+        .tolist()
+    )
+    eligible_pool_count = len(eligible_candidate_ids)
+    if eligible_pool_count <= 0:
+        payload = {
+            "is_exhausted": False,
+            "total_pool_count": total_pool_count,
+            "eligible_pool_count": 0,
+            "shown_eligible_count": 0,
+        }
+        log.info(
+            "recommendation_cycle_exhaustion_evaluated",
+            actor_user_id=actor_user_id,
+            stage=stage.value,
+            **payload,
+        )
+        return payload
+
+    shown_candidate_ids = get_shown_candidate_ids(
+        actor_user_id,
+        candidate_user_ids=eligible_candidate_ids,
+    )
+    shown_eligible_count = len(shown_candidate_ids)
+    is_exhausted = shown_eligible_count >= eligible_pool_count
+    payload = {
+        "is_exhausted": is_exhausted,
+        "total_pool_count": total_pool_count,
+        "eligible_pool_count": eligible_pool_count,
+        "shown_eligible_count": shown_eligible_count,
+    }
+    log.info(
+        "recommendation_cycle_exhaustion_evaluated",
+        actor_user_id=actor_user_id,
+        stage=stage.value,
+        **payload,
+    )
+    return payload
+
+
+def _exclude_already_shown_candidates(candidate_df: pd.DataFrame) -> pd.DataFrame:
+    if candidate_df.empty or "already_shown" not in candidate_df.columns:
+        return candidate_df.reset_index(drop=True)
+
+    before_count = int(candidate_df.shape[0])
+    result = candidate_df[~candidate_df["already_shown"].astype(bool)].copy()
+    removed_count = before_count - int(result.shape[0])
+    if removed_count > 0:
+        log.info(
+            "recommendation_shown_candidates_removed",
+            before_count=before_count,
+            after_count=int(result.shape[0]),
+            removed_count=removed_count,
+        )
+    return result.reset_index(drop=True)
 
 
 def _has_transaction_profile(user_id: str) -> bool:
@@ -580,14 +669,58 @@ def _safe_fetch(fetcher, conf: RerankConfig) -> pd.DataFrame:
     return source_df.copy()
 
 
-def _build_fallback_conf(conf, *, top_n: int):
+def _build_fallback_conf(conf, *, top_n: int, candidate_pool_size: int = 0):
     if not isinstance(conf, RerankConfig):
         return conf
     fallback_top_n = max(int(top_n) * 12, 40)
     configured_top_n = int(getattr(conf, "top_n", 0) or 0)
+    if int(candidate_pool_size) > 0:
+        fallback_top_n = max(fallback_top_n, candidate_pool_size)
     if configured_top_n > 0:
-        fallback_top_n = min(fallback_top_n, configured_top_n)
+        fallback_top_n = max(fallback_top_n, configured_top_n)
     return replace(conf, top_n=max(fallback_top_n, int(top_n)))
+
+
+def _get_offline_candidate_pool_size(*, actor_user_id: str | None) -> int:
+    normalized_actor_user_id = normalize_user_id(actor_user_id, allow_hash=True)
+    if normalized_actor_user_id is None:
+        return 0
+    return len(_get_offline_candidate_ids(actor_user_id=normalized_actor_user_id))
+
+
+def _get_offline_candidate_ids(*, actor_user_id: str) -> set[str]:
+    from ml.candidates import interactions_candidates, transactions_candidates
+
+    candidate_ids: set[str] = set()
+    warmup_by_source = {
+        "transactions": transactions_candidates.warmup_search_bundle,
+        "tx_interaction": interactions_candidates.warmup_search_bundle,
+    }
+    for source_name, warmup in warmup_by_source.items():
+        try:
+            bundle = warmup()
+        except Exception as exc:
+            log.warning(
+                "recommendation_offline_pool_source_failed",
+                actor_user_id=actor_user_id,
+                source=source_name,
+                error=str(exc),
+            )
+            continue
+        if not bundle:
+            continue
+
+        source_user_ids = bundle.get("user_ids")
+        if source_user_ids is None:
+            continue
+        for raw_candidate_user_id in source_user_ids:
+            normalized_candidate_user_id = normalize_user_id(raw_candidate_user_id, allow_hash=True)
+            if normalized_candidate_user_id is None:
+                continue
+            if normalized_candidate_user_id == actor_user_id:
+                continue
+            candidate_ids.add(normalized_candidate_user_id)
+    return candidate_ids
 
 
 def _log_step_timing(
