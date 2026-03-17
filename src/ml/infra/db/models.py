@@ -1,7 +1,7 @@
 from datetime import datetime
 
 from sqlalchemy import Boolean, DateTime, Float, Index, Integer, String
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
@@ -23,11 +23,11 @@ class Interaction(Base):
         ),
     )
 
-    id: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), primary_key=True)
+    id: Mapped[str] = mapped_column(String, primary_key=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    actor_user_id: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), nullable=False)
-    candidate_user_id: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), nullable=False)
+    actor_user_id: Mapped[str] = mapped_column(String, nullable=False)
+    candidate_user_id: Mapped[str] = mapped_column(String, nullable=False)
     action: Mapped[str] = mapped_column(String(32), nullable=False)
     ml_recommendation_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
@@ -45,7 +45,7 @@ class MLRecommendationGroup(Base):
     )
 
     ml_recommendation_id: Mapped[str] = mapped_column(String, primary_key=True)
-    actor_user_id: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), nullable=False)
+    actor_user_id: Mapped[str] = mapped_column(String, nullable=False)
     shown_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     served_stage: Mapped[str] = mapped_column(String(16), nullable=False, default="stage_4")
     group_status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
@@ -65,8 +65,8 @@ class MLRecommendationImpression(Base):
     )
 
     ml_recommendation_id: Mapped[str] = mapped_column(String, primary_key=True)
-    actor_user_id: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), primary_key=True)
-    candidate_user_id: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), primary_key=True)
+    actor_user_id: Mapped[str] = mapped_column(String, primary_key=True)
+    candidate_user_id: Mapped[str] = mapped_column(String, primary_key=True)
     shown_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     last_interaction_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     final_action: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -86,16 +86,6 @@ class MLRecommendationImpression(Base):
     source_row_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
 
 
-class MLRecommendationCycleState(Base):
-    __tablename__ = "ml_recommendation_cycle_state"
-    __table_args__ = (
-        Index("ix_ml_recommendation_cycle_state_started_at", "cycle_started_at"),
-    )
-
-    actor_user_id: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), primary_key=True)
-    cycle_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-
-
 class MLRecommendationSample(Base):
     __tablename__ = "ml_recommendation_samples"
     __table_args__ = (
@@ -110,8 +100,8 @@ class MLRecommendationSample(Base):
 
     ml_recommendation_id: Mapped[str] = mapped_column(String, primary_key=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    user_id: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), nullable=False)
-    candidate_user_id: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), nullable=False)
+    user_id: Mapped[str] = mapped_column(String, nullable=False)
+    candidate_user_id: Mapped[str] = mapped_column(String, nullable=False)
     rerank_mode: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     features_json: Mapped[dict] = mapped_column(JSONB, nullable=False)

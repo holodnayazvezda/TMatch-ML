@@ -169,7 +169,6 @@ def _prepare_source_frame(
     is_candidate_col = f"retrieval_{source_name}_is_candidate"
     rank_col = f"retrieval_{source_name}_rank"
     score_col = f"retrieval_{source_name}_score"
-    cluster_col = f"retrieval_{source_name}_cluster_id"
 
     if source_df.empty or limit <= 0:
         return pd.DataFrame(columns=[QUERY_ID_COLUMN, CANDIDATE_ID_COLUMN, is_candidate_col, rank_col, score_col])
@@ -224,41 +223,24 @@ def _prepare_source_frame(
     else:
         score_values = pd.Series(np.nan, index=source_df.index, dtype=float)
 
-    base_frame = source_df[[QUERY_ID_COLUMN, CANDIDATE_ID_COLUMN]].copy()
-    retrieval_flags_frame = pd.DataFrame(
-        {
-            is_candidate_col: pd.Series(1, index=source_df.index, dtype="int8"),
-            rank_col: source_df["_source_rank"].astype(float),
-            score_col: score_values.astype(float),
-        },
-        index=source_df.index,
-    )
-    source_cluster_column = _pick_first_existing_column(
-        source_df,
-        ["transaction_cluster_id", "cluster_id"],
-    )
-    if source_cluster_column is not None:
-        retrieval_flags_frame[cluster_col] = source_df[source_cluster_column].astype("string")
+    result = source_df[[QUERY_ID_COLUMN, CANDIDATE_ID_COLUMN]].copy()
+    result[is_candidate_col] = 1
+    result[rank_col] = source_df["_source_rank"].astype(float)
+    result[score_col] = score_values.astype(float)
 
-    source_feature_columns = [
-        column
-        for column in ("impactful_features", "impactful_features_origin", "impactful_features_seed_basis")
-        if column in source_df.columns
-    ]
-    if source_feature_columns:
-        feature_frame = source_df[source_feature_columns].copy()
-        feature_frame.columns = [f"retrieval_{source_name}_feature_{column}" for column in source_feature_columns]
-        result = pd.concat(
-            [base_frame, retrieval_flags_frame, feature_frame],
-            axis=1,
-            copy=False,
-        )
-    else:
-        result = pd.concat(
-            [base_frame, retrieval_flags_frame],
-            axis=1,
-            copy=False,
-        )
+    feature_columns_to_skip = {
+        QUERY_ID_COLUMN,
+        CANDIDATE_ID_COLUMN,
+        candidate_id_col,
+        source_query_column,
+        source_rank_column,
+        "_source_rank",
+    }
+    for column in source_df.columns:
+        if column in feature_columns_to_skip:
+            continue
+        prefixed_column = f"retrieval_{source_name}_feature_{column}"
+        result[prefixed_column] = source_df[column]
 
     result = result.drop_duplicates(
         subset=[QUERY_ID_COLUMN, CANDIDATE_ID_COLUMN],
@@ -297,59 +279,37 @@ def _add_common_retrieval_features(merged: pd.DataFrame, source_names: list[str]
     is_candidate_cols = [f"retrieval_{name}_is_candidate" for name in source_names]
     rank_cols = [f"retrieval_{name}_rank" for name in source_names]
     score_cols = [f"retrieval_{name}_score" for name in source_names]
-    source_presence = merged[is_candidate_cols].fillna(0).astype("int8")
 
-    merged["retrieval_sources_count"] = source_presence.sum(axis=1).astype("int16")
+    merged["retrieval_sources_count"] = merged[is_candidate_cols].sum(axis=1).astype("int16")
     merged["retrieval_best_rank"] = merged[rank_cols].min(axis=1, skipna=True)
     merged["retrieval_mean_rank"] = merged[rank_cols].mean(axis=1, skipna=True)
     merged["retrieval_best_score"] = merged[score_cols].max(axis=1, skipna=True)
     merged["retrieval_mean_score"] = merged[score_cols].mean(axis=1, skipna=True)
-    merged["retrieval_sources"] = [
-        ",".join(source_name for source_name, is_present in zip(source_names, row, strict=False) if is_present == 1)
-        for row in source_presence.to_numpy(dtype="int8")
-    ]
+    merged["retrieval_sources"] = merged.apply(
+        lambda row: ",".join(
+            source_name
+            for source_name in source_names
+            if row.get(f"retrieval_{source_name}_is_candidate", 0) == 1
+        ),
+        axis=1,
+    )
     merged["retrieval_primary_source"] = merged[rank_cols].idxmin(axis=1, skipna=True).str.replace(
         "retrieval_", "",
     ).str.replace("_rank", "")
-    cluster_cols = [
-        f"retrieval_{source_name}_cluster_id"
-        for source_name in source_names
-        if f"retrieval_{source_name}_cluster_id" in merged.columns
-    ]
-    if cluster_cols:
-        merged["transaction_cluster_id"] = (
-            merged[cluster_cols]
-            .astype("string")
-            .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
-            .bfill(axis=1)
-            .iloc[:, 0]
-        )
-    else:
-        merged["transaction_cluster_id"] = pd.NA
-    if "retrieval_exotic_cluster_id" in merged.columns:
-        merged["cluster_id"] = merged["retrieval_exotic_cluster_id"]
     merged["query_party_rk"] = merged[QUERY_ID_COLUMN]
     merged["party_rk"] = merged[CANDIDATE_ID_COLUMN]
     merged["rank"] = merged["retrieval_best_rank"]
     merged["distance_euclidean"] = np.nan
     merged["impactful_features"] = None
-    merged["impactful_features_origin"] = None
-    merged["impactful_features_seed_basis"] = None
 
     for source_name in source_names:
         source_mask = merged["retrieval_primary_source"] == source_name
         source_score_column = f"retrieval_{source_name}_score"
         source_impactful_column = f"retrieval_{source_name}_feature_impactful_features"
-        source_impactful_origin_column = f"retrieval_{source_name}_feature_impactful_features_origin"
-        source_impactful_seed_column = f"retrieval_{source_name}_feature_impactful_features_seed_basis"
         if source_score_column in merged.columns:
             merged.loc[source_mask, "distance_euclidean"] = merged.loc[source_mask, source_score_column]
         if source_impactful_column in merged.columns:
             merged.loc[source_mask, "impactful_features"] = merged.loc[source_mask, source_impactful_column]
-        if source_impactful_origin_column in merged.columns:
-            merged.loc[source_mask, "impactful_features_origin"] = merged.loc[source_mask, source_impactful_origin_column]
-        if source_impactful_seed_column in merged.columns:
-            merged.loc[source_mask, "impactful_features_seed_basis"] = merged.loc[source_mask, source_impactful_seed_column]
 
     return merged
 

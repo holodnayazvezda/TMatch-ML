@@ -6,7 +6,6 @@ from typing import Any
 
 import structlog
 from sqlalchemy import bindparam, text
-from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import Session
 
 from ml.config import settings
@@ -38,8 +37,6 @@ class InteractionEventPoller:
         )
         self._task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
-        self._last_error_signature: str | None = None
-        self._consecutive_failure_count = 0
 
     def start(self) -> None:
         if self._task is not None and not self._task.done():
@@ -62,51 +59,17 @@ class InteractionEventPoller:
             batch_size=self.batch_size,
         )
         while not self._stop_event.is_set():
-            sleep_seconds = max(self.poll_interval_seconds, 0.0)
             try:
                 summary = await asyncio.to_thread(poll_audit_events_once, self.batch_size)
-                if self._consecutive_failure_count > 0:
-                    log.info(
-                        "interaction_event_poller_recovered",
-                        consecutive_failure_count=self._consecutive_failure_count,
-                    )
-                self._consecutive_failure_count = 0
-                self._last_error_signature = None
                 if summary.get("selected_total", 0) > 0:
                     log.info("interaction_event_poller_cycle_finished", **summary)
             except Exception as exc:
-                self._consecutive_failure_count += 1
-                error_signature = _build_error_signature(exc)
-                sleep_seconds = _compute_retry_delay(
-                    self.poll_interval_seconds,
-                    self._consecutive_failure_count,
-                )
-
-                should_log_warning = (
-                    error_signature != self._last_error_signature
-                    or self._consecutive_failure_count in {1, 5, 20}
-                )
-                if should_log_warning:
-                    log.warning(
-                        "interaction_event_poller_cycle_failed",
-                        error=str(exc),
-                        consecutive_failure_count=self._consecutive_failure_count,
-                        retry_in_seconds=round(sleep_seconds, 2),
-                    )
-                self._last_error_signature = error_signature
-
-                if _is_non_retryable_schema_error(exc):
-                    log.error(
-                        "interaction_event_poller_disabled",
-                        reason="non_retryable_schema_error",
-                        error=str(exc),
-                    )
-                    break
+                log.warning("interaction_event_poller_cycle_failed", error=str(exc))
 
             try:
                 await asyncio.wait_for(
                     self._stop_event.wait(),
-                    timeout=sleep_seconds,
+                    timeout=max(self.poll_interval_seconds, 0.0),
                 )
             except TimeoutError:
                 continue
@@ -215,24 +178,3 @@ def _empty_poll_summary() -> dict[str, int]:
         "pending_row_count": 0,
         "ignored_non_training_action_count": 0,
     }
-
-
-def _compute_retry_delay(base_delay_seconds: float, consecutive_failure_count: int) -> float:
-    bounded_failure_count = max(0, min(int(consecutive_failure_count), 6))
-    return min(max(float(base_delay_seconds), 0.5) * (2**bounded_failure_count), 30.0)
-
-
-def _build_error_signature(exc: Exception) -> str:
-    return f"{type(exc).__name__}:{str(exc).strip()}"
-
-
-def _is_non_retryable_schema_error(exc: Exception) -> bool:
-    if isinstance(exc, ProgrammingError):
-        message = str(exc)
-        if "UndefinedTable" in message:
-            return True
-        if 'relation "audit_events" does not exist' in message:
-            return True
-        if 'отношение "audit_events" не существует' in message:
-            return True
-    return False

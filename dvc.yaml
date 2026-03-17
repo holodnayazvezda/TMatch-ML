@@ -1,0 +1,17 @@
+stages:
+  train_models:
+    cmd: PYTHONPATH=src uv run train-models --config mlops/training_config.json --emit-dvc-metrics reports/model_training_metrics.json --emit-version-manifest reports/model_version_manifest.json
+    deps:
+      - mlops/training_config.json
+      - src/ml/services/model_training.py
+      - src/ml/services/model_versioning.py
+      - src/ml/services/recommendation_feature_snapshot.py
+      - src/ml/services/recommendation_ranking.py
+      - src/ml/services/recommendation_store.py
+      - src/core/data_config.py
+    outs:
+      - data_out/models/stage_2_3
+      - data_out/models/stage_4
+      - reports/model_version_manifest.json
+    metrics:
+      - reports/model_training_metrics.json

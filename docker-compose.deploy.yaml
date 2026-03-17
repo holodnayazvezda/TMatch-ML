@@ -1,57 +1,16 @@
 services:
-  ml-artifacts:
-    image: ${ML_IMAGE:-ml:latest}
-    restart: "no"
-    env_file:
-      - .env
-    environment:
-      ROOT_PATH: ${ROOT_PATH:-/ml}
-      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
-      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
-      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
-      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
-      POSTGRES_DB: "${POSTGRES_DB:-ml_db}"
-    command: ["sh", "-c", "uv run build-offline-artifacts --all --force"]
-    volumes:
-      - ./data:/app/data
-      - ./data_out:/app/data_out
-    networks:
-      shared:
-        aliases:
-          - ml-artifacts-internal
-
   ml:
     image: ${ML_IMAGE:-ml:latest}
     restart: always
-    depends_on:
-      ml-artifacts:
-        condition: service_completed_successfully
     ports:
       - "${ML_PORT:-8080}:${SERVER_PORT:-8080}"
     env_file:
       - .env
     environment:
       ROOT_PATH: ${ROOT_PATH:-/ml}
-      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
-      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
-      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
-      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
-      POSTGRES_DB: "${POSTGRES_DB:-ml_db}"
-    command: ["sh", "-c", "uv run check-offline-artifacts-ready && uv run api"]
     volumes:
       - ./data:/app/data
       - ./data_out:/app/data_out
-    healthcheck:
-      test: [
-        "CMD",
-        "python",
-        "-c",
-        "import urllib.request; urllib.request.urlopen('http://localhost:${SERVER_PORT:-8080}/health/ready')",
-      ]
-      interval: 20s
-      timeout: 30s
-      start_period: 180s
-      retries: 3
     networks:
       shared:
         aliases:

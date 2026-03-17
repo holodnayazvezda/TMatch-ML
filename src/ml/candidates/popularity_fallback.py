@@ -1,61 +1,16 @@
 from __future__ import annotations
 
-from threading import Lock
 from typing import Any
 
 import pandas as pd
-import structlog
+from sqlalchemy import select
 
-from core.data_config import Paths
-from ml.candidates import transactions_candidates
 from ml.infra.blocked_service import InteractionBlocklistService
-from ml.services.serving_policy import log_lazy_rebuild_blocked
+from ml.infra.db.models import Interaction
+from ml.infra.db.session import SessionLocal
 from ml.services.user_id import normalize_user_id
 
 _BLOCKLIST_SERVICE = InteractionBlocklistService()
-_SNAPSHOT_PATH = Paths.popularity_snapshot_path
-_CACHE_LOCK = Lock()
-_CACHED_SNAPSHOT_DF: pd.DataFrame | None = None
-_CACHED_SNAPSHOT_MTIME: float | None = None
-
-log: structlog.BoundLogger = structlog.get_logger(__name__)
-
-
-def warmup_popularity_snapshot(*, force_reload: bool = False) -> dict[str, object]:
-    snapshot_df = _get_popularity_snapshot(force_reload=force_reload)
-    status_payload = get_popularity_snapshot_status()
-    status_payload["row_count"] = int(snapshot_df.shape[0])
-    return status_payload
-
-
-def get_popularity_snapshot_status() -> dict[str, object]:
-    snapshot_path = _SNAPSHOT_PATH
-    if not snapshot_path.exists():
-        return {
-            "source": "popularity",
-            "status": "missing",
-            "snapshot_path": str(snapshot_path),
-        }
-
-    try:
-        snapshot_df = _get_popularity_snapshot(force_reload=False)
-    except Exception as exc:
-        return {
-            "source": "popularity",
-            "status": "invalid",
-            "snapshot_path": str(snapshot_path),
-            "error": str(exc),
-        }
-
-    latest_mtime = float(snapshot_path.stat().st_mtime)
-    artifact_age_seconds = max(0.0, pd.Timestamp.utcnow().timestamp() - latest_mtime)
-    return {
-        "source": "popularity",
-        "status": "ready",
-        "snapshot_path": str(snapshot_path),
-        "row_count": int(snapshot_df.shape[0]),
-        "artifact_age_seconds": round(artifact_age_seconds, 3),
-    }
 
 
 def get_popular_candidates(conf) -> pd.DataFrame:
@@ -64,59 +19,100 @@ def get_popular_candidates(conf) -> pd.DataFrame:
     if actor_user_id is None or top_n <= 0:
         return pd.DataFrame()
 
-    snapshot_df = _get_popularity_snapshot()
-    if snapshot_df.empty:
+    weights = {
+        str(action).strip().lower(): float(weight)
+        for action, weight in dict(getattr(conf, "popularity_action_weights", {}) or {}).items()
+    }
+    if not weights:
+        weights = {
+            "like": 3.0,
+            "match": 8.0,
+            "chat_started": 4.0,
+            "skip": -1.0,
+            "dislike": -6.0,
+            "block": -15.0,
+        }
+
+    try:
+        with SessionLocal() as session:
+            stmt = (
+                select(
+                    Interaction.candidate_user_id,
+                    Interaction.action,
+                )
+                .where(Interaction.deleted_at.is_(None))
+            )
+            rows = list(session.execute(stmt).all())
+    except Exception:
         return pd.DataFrame()
 
-    query_limit = max(top_n * 20, top_n)
-    candidates_df = snapshot_df.head(query_limit).copy()
-    if candidates_df.empty:
+    if not rows:
         return pd.DataFrame()
 
-    candidate_ids = candidates_df["candidate_id"].astype("string").tolist()
+    popularity_by_candidate: dict[str, float] = {}
+    for candidate_user_id, action in rows:
+        normalized_candidate_user_id = normalize_user_id(candidate_user_id, allow_hash=True)
+        normalized_action = str(action).strip().lower()
+        if normalized_candidate_user_id is None:
+            continue
+        popularity_by_candidate[normalized_candidate_user_id] = (
+            popularity_by_candidate.get(normalized_candidate_user_id, 0.0)
+            + float(weights.get(normalized_action, 0.0))
+        )
+
+    if not popularity_by_candidate:
+        return pd.DataFrame()
+
     try:
         blocked_candidate_ids = _BLOCKLIST_SERVICE.get_blocked_targets(
             actor_user_id=actor_user_id,
-            candidate_user_ids=candidate_ids,
+            candidate_user_ids=list(popularity_by_candidate),
         )
     except Exception:
         blocked_candidate_ids = set()
-
-    impactful_feature_count = int(
-        getattr(
-            conf,
-            "an_impactful_features",
-            transactions_candidates.CandidateConfig.an_impactful_features,
-        )
-        or 0
-    )
     rows_for_frame: list[dict[str, Any]] = []
-    for candidate_row in candidates_df.to_dict(orient="records"):
-        candidate_user_id = normalize_user_id(candidate_row.get("candidate_id"), allow_hash=True)
-        if candidate_user_id is None:
-            continue
+    for candidate_user_id, popularity_score in sorted(
+        popularity_by_candidate.items(),
+        key=lambda item: (-item[1], item[0]),
+    ):
         if candidate_user_id == actor_user_id:
             continue
         if candidate_user_id in blocked_candidate_ids:
             continue
-        seed_basis = f"{actor_user_id}:{candidate_user_id}:popularity"
         rows_for_frame.append(
             {
                 "rank": len(rows_for_frame) + 1,
                 "query_party_rk": actor_user_id,
                 "party_rk": candidate_user_id,
                 "popularity_score": float(candidate_row.get("popularity_score", 0.0)),
-                "impactful_features": transactions_candidates._extract_seeded_impactful_features(
-                    seed_value=seed_basis,
-                    top_k=impactful_feature_count,
-                ),
-                "impactful_features_origin": "seeded_fallback",
                 "impactful_features_seed_basis": seed_basis,
             }
         )
         if len(rows_for_frame) >= top_n:
             break
-    return pd.DataFrame(rows_for_frame)
+
+    result_df = pd.DataFrame(rows_for_frame)
+    if result_df.empty:
+        return result_df
+
+    support_weights = transactions_candidates._compute_support_weights_from_scores(
+        result_df["popularity_score"].to_numpy(dtype=float),
+        lower_is_better=False,
+    )
+    seed_basis_values = result_df["impactful_features_seed_basis"].astype("string").tolist()
+    impactful_features, impactful_origins, impactful_seed_basis = (
+        transactions_candidates.build_impactful_features_for_candidate_ids(
+            query_user_id=actor_user_id,
+            candidate_user_ids=result_df["party_rk"].astype("string").tolist(),
+            top_k=impactful_feature_count,
+            support_weights=support_weights,
+            seed_bases=seed_basis_values,
+        )
+    )
+    result_df["impactful_features"] = impactful_features
+    result_df["impactful_features_origin"] = impactful_origins
+    result_df["impactful_features_seed_basis"] = impactful_seed_basis
+    return result_df
 
 
 def _get_popularity_snapshot(*, force_reload: bool = False) -> pd.DataFrame:

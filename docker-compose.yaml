@@ -1,63 +1,11 @@
 services:
-  postgres:
-    image: postgres:16
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
-      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
-      POSTGRES_DB: "${POSTGRES_DB:-ml_db}"
-    ports:
-      - "${POSTGRES_PORT:-5432}:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-ml_db}",
-        ]
-      interval: 5s
-      timeout: 5s
-      retries: 20
-
-  ml-artifacts:
-    build: .
-    restart: "no"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    env_file:
-      - .env
-    environment:
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
-      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
-      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
-      POSTGRES_DB: "${POSTGRES_DB:-ml_db}"
-    command: ["sh", "-c", "uv run build-offline-artifacts --all --force"]
-    volumes:
-      - ./data:/app/data
-      - ./data_out:/app/data_out
-
   ml:
     build: .
     restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-      ml-artifacts:
-        condition: service_completed_successfully
     ports:
       - "${SERVER_PORT:-8080}:${SERVER_PORT:-8080}"
     env_file:
       - .env
-    environment:
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
-      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
-      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
-      POSTGRES_DB: "${POSTGRES_DB:-ml_db}"
-    command: ["sh", "-c", "uv run check-offline-artifacts-ready && uv run api"]
     volumes:
       - ./data:/app/data
       - ./data_out:/app/data_out
@@ -66,12 +14,9 @@ services:
         "CMD",
         "python",
         "-c",
-        "import urllib.request; urllib.request.urlopen('http://localhost:${SERVER_PORT:-8080}/health/ready')",
+        "import urllib.request; urllib.request.urlopen('http://localhost:${SERVER_PORT:-8080}/health')",
       ]
       interval: 20s
       timeout: 30s
       start_period: 180s
       retries: 3
-
-volumes:
-  postgres_data:

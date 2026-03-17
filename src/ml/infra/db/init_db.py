@@ -4,6 +4,7 @@ from threading import Lock
 
 from sqlalchemy import text
 
+from .base import Base
 from .session import engine
 
 _SCHEMA_INIT_LOCK = Lock()
@@ -19,30 +20,61 @@ def init_db(force: bool = False) -> None:
     with _SCHEMA_INIT_LOCK:
         if _SCHEMA_READY and not force:
             return
-        from . import interaction_feature_tables, models
 
-        managed_tables = (
-            interaction_feature_tables.user_interaction_features_table,
-            models.MLRecommendationGroup.__table__,
-            models.MLRecommendationImpression.__table__,
-            models.MLRecommendationCycleState.__table__,
-            models.MLRecommendationSample.__table__,
-        )
-        for table in managed_tables:
-            table.create(bind=engine, checkfirst=True)
+        # Import models/tables lazily so they are registered in Base.metadata.
+        from . import interaction_feature_tables, models  # noqa: F401
+
+        Base.metadata.create_all(bind=engine)
 
         with engine.begin() as connection:
-            for table_name, column_name in (
-                ("user_interaction_features", "user_id"),
-                ("ml_recommendation_groups", "actor_user_id"),
-                ("ml_recommendation_impressions", "actor_user_id"),
-                ("ml_recommendation_impressions", "candidate_user_id"),
-                ("ml_recommendation_cycle_state", "actor_user_id"),
-                ("ml_recommendation_samples", "user_id"),
-                ("ml_recommendation_samples", "candidate_user_id"),
-            ):
-                _ensure_uuid_column(connection, table_name=table_name, column_name=column_name)
-
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_interactions_actor_user_id
+                    ON interactions (actor_user_id)
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_interactions_candidate_user_id
+                    ON interactions (candidate_user_id)
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_interactions_actor_created_at
+                    ON interactions (actor_user_id, created_at)
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_interactions_candidate_created_at
+                    ON interactions (candidate_user_id, created_at)
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_interactions_actor_candidate_created_at
+                    ON interactions (actor_user_id, candidate_user_id, created_at)
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_interactions_ml_recommendation_id
+                    ON interactions (ml_recommendation_id)
+                    """
+                )
+            )
             connection.execute(
                 text(
                     """
@@ -110,14 +142,6 @@ def init_db(force: bool = False) -> None:
             connection.execute(
                 text(
                     """
-                    CREATE INDEX IF NOT EXISTS ix_ml_recommendation_cycle_state_started_at
-                    ON ml_recommendation_cycle_state (cycle_started_at)
-                    """
-                )
-            )
-            connection.execute(
-                text(
-                    """
                     CREATE INDEX IF NOT EXISTS ix_ml_recommendation_impressions_group_id
                     ON ml_recommendation_impressions (ml_recommendation_id)
                     """
@@ -139,30 +163,24 @@ def init_db(force: bool = False) -> None:
                     """
                 )
             )
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_audit_events_sent_to_ml_created_at
+                    ON audit_events (sent_to_ml, created_at)
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_audit_events_ml_recommendation_id
+                    ON audit_events (ml_recommendation_id)
+                    """
+                )
+            )
+
         _SCHEMA_READY = True
-
-
-def _ensure_uuid_column(connection, *, table_name: str, column_name: str) -> None:
-    connection.execute(
-        text(
-            f"""
-            DO $$
-            BEGIN
-                IF EXISTS (
-                    SELECT 1
-                    FROM information_schema.columns
-                    WHERE table_schema = current_schema()
-                      AND table_name = '{table_name}'
-                      AND column_name = '{column_name}'
-                      AND data_type <> 'uuid'
-                ) THEN
-                    EXECUTE 'ALTER TABLE {table_name} ALTER COLUMN {column_name} TYPE UUID USING {column_name}::uuid';
-                END IF;
-            END
-            $$;
-            """
-        )
-    )
 
 
 if __name__ == "__main__":

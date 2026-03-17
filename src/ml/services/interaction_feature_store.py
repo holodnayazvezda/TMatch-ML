@@ -21,7 +21,6 @@ from ml.infra.db.init_db import init_db
 from ml.infra.db.interaction_feature_tables import user_interaction_features_table
 from ml.infra.db.models import Interaction
 from ml.infra.db.session import SessionLocal
-from ml.services.user_id import normalize_user_id, normalize_uuid
 
 ADVISORY_LOCK_KEY = 902_451
 RAW_INTERACTION_BATCH_SIZE = 5_000
@@ -316,13 +315,13 @@ def _normalize_storage_events(events: Sequence[dict[str, Any]]) -> list[dict[str
 
 
 def _normalize_storage_event(raw_event: dict[str, Any]) -> dict[str, Any] | None:
-    event_id = normalize_uuid(
+    event_id = _normalize_string(
         raw_event.get("event_id")
         or raw_event.get("audit_event_id")
         or raw_event.get("id")
     )
-    actor_user_id = _normalize_user_id(raw_event.get("actor_user_id"))
-    target_user_id = _normalize_user_id(
+    actor_user_id = _normalize_string(raw_event.get("actor_user_id"))
+    target_user_id = _normalize_string(
         raw_event.get("target_user_id") or raw_event.get("candidate_user_id")
     )
 
@@ -370,7 +369,7 @@ def _collect_affected_user_ids(events: Sequence[dict[str, Any]]) -> list[str]:
 def _normalize_user_ids(user_ids: Iterable[str]) -> list[str]:
     normalized: set[str] = set()
     for user_id in user_ids:
-        normalized_user_id = _normalize_user_id(user_id)
+        normalized_user_id = _normalize_string(user_id)
         if normalized_user_id is not None:
             normalized.add(normalized_user_id)
     return sorted(normalized)
@@ -394,10 +393,6 @@ def _normalize_string(raw_value: Any) -> str | None:
     if not value:
         return None
     return value
-
-
-def _normalize_user_id(raw_value: Any) -> str | None:
-    return normalize_user_id(raw_value, allow_hash=True)
 
 
 def _chunked(values: Sequence[Any], chunk_size: int) -> Iterable[list[Any]]:

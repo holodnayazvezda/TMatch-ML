@@ -1,0 +1,45 @@
+{
+  "limit": null,
+  "feature_builder_version": "v1",
+  "targets": [
+    "like",
+    "dislike",
+    "match",
+    "block"
+  ],
+  "catboost": {
+    "loss_function": "Logloss",
+    "eval_metric": "Logloss",
+    "iterations": 200,
+    "depth": 6,
+    "learning_rate": 0.05,
+    "random_seed": 42,
+    "verbose": false
+  },
+  "mlflow": {
+    "enabled": true,
+    "tracking_uri": "file:./data_out/mlruns",
+    "experiment_name": "recommendation-training"
+  },
+  "families": {
+    "stage_2_3": {
+      "served_stages": [
+        "stage_2",
+        "stage_3"
+      ]
+    },
+    "stage_4": {
+      "served_stages": [
+        "stage_4"
+      ]
+    }
+  },
+  "version_tracking": {
+    "tracked_paths": [
+      "data_out/user_features_all.parquet",
+      "data_out/user_features_tx_interaction.parquet",
+      "data_out/popularity_snapshot.parquet",
+      "data_out/offline_artifacts_manifest.json"
+    ]
+  }
+}

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import polars as pl
 from sqlalchemy import Boolean, Column, DateTime, Float, Integer, String, Table
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 
 from ml.featurize.interactions_features import get_user_interaction_feature_schema
 
@@ -37,7 +36,7 @@ def _build_feature_columns() -> list[Column]:
     for column_name, dtype in get_user_interaction_feature_schema().items():
         sqlalchemy_type = _sqlalchemy_type_from_polars(dtype)
         if column_name == "user_id":
-            columns.append(Column(column_name, PG_UUID(as_uuid=False), primary_key=True))
+            columns.append(Column(column_name, String, primary_key=True))
             continue
 
         nullable = column_name != "snapshot_at"
