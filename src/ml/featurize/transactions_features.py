@@ -1,10 +1,11 @@
+import json
 import re
 from pathlib import Path
 
 import polars as pl
 
-from src.core.data_config import Paths
-from src.ml.services.user_id import normalize_user_id
+from core.data_config import Paths
+from ml.services.user_id import normalize_user_id
 
 PATHS = Paths()
 
@@ -21,8 +22,6 @@ DAILY_FEATURES_PATH = FEATURES_DIR / f"daily_features_{PIPELINE_VERSION}.parquet
 CATEGORY_FEATURES_PATH = FEATURES_DIR / f"category_features_{PIPELINE_VERSION}.parquet"
 MCC_FEATURES_PATH = FEATURES_DIR / f"mcc_features_{PIPELINE_VERSION}.parquet"
 MERCHANT_FEATURES_PATH = FEATURES_DIR / f"merchant_features_{PIPELINE_VERSION}.parquet"
-
-# Canonical transaction feature snapshot for downstream retrieval.
 FINAL_PARQUET_PATH = PATHS.transaction_user_features_parquet_path
 FINAL_CSV_PATH = PATHS.transaction_user_features_csv_path
 
@@ -130,7 +129,7 @@ TRAIT_MIN_VALID_COMPONENTS_TRAVELER = 2
 
 TRAIT_ELIGIBILITY_MIN_TXN_CNT = 20
 TRAIT_ELIGIBILITY_MIN_ACTIVE_DAYS_CNT = 10
-TRAIT_ELIGIBILITY_MIN_ACTIVITY_SPAN_DAYS = 10
+TRAIT_ELIGIBILITY_MIN_ACTIVITY_SPAN_DAYS = 30
 
 TRAIT_SUPPORT_TXN_REFERENCE = 50.0
 TRAIT_SUPPORT_ACTIVE_DAYS_REFERENCE = 20.0
@@ -222,6 +221,7 @@ def validate_inputs() -> list[Path]:
     csv_files = []
     for i in range(1, 2):
         folder = DATA_DIR / f"Data_{i}"
+        print(folder)
         if folder.exists():
             csv_files.extend(sorted(folder.glob("*.csv")))
 
@@ -242,8 +242,13 @@ def validate_inputs() -> list[Path]:
     return csv_files
 
 
-def build_tx_layer(csv_files: list[Path]) -> None:
-    if TX_LAYER_PATH.exists() and not REBUILD_TX_LAYER:
+def build_tx_layer(
+    csv_files: list[Path],
+    *,
+    tx_layer_path: Path = TX_LAYER_PATH,
+    rebuild_tx_layer: bool = REBUILD_TX_LAYER,
+) -> None:
+    if tx_layer_path.exists() and not rebuild_tx_layer:
         return
 
     raw_lf = pl.scan_csv(
@@ -287,7 +292,7 @@ def build_tx_layer(csv_files: list[Path]) -> None:
         pl.col("real_transaction_dttm").dt.weekday().cast(pl.Int8).alias("weekday_num"),
     )
 
-    sink_parquet(TX_LAYER_PATH, tx_layer_lf)
+    sink_parquet(tx_layer_path, tx_layer_lf)
 
 
 def get_top_buckets(tx_lf: pl.LazyFrame):
@@ -537,59 +542,336 @@ def build_merchant_features_lf(tx_lf: pl.LazyFrame) -> pl.LazyFrame:
     )
 
 
-def build_feature_stages(tx_lf: pl.LazyFrame) -> None:
+def build_feature_stages(
+    tx_lf: pl.LazyFrame,
+    *,
+    base_features_path: Path = BASE_FEATURES_PATH,
+    daily_features_path: Path = DAILY_FEATURES_PATH,
+    category_features_path: Path = CATEGORY_FEATURES_PATH,
+    mcc_features_path: Path = MCC_FEATURES_PATH,
+    merchant_features_path: Path = MERCHANT_FEATURES_PATH,
+    rebuild_feature_stages: bool = REBUILD_FEATURE_STAGES,
+) -> None:
     top_category_values, top_mcc_values, mcc_bucket_values, category_share_name_map, mcc_share_name_map = get_top_buckets(tx_lf)
 
     sink_parquet_stage(
-        BASE_FEATURES_PATH,
+        base_features_path,
         build_base_activity_lf(tx_lf),
-        rebuild=REBUILD_FEATURE_STAGES,
+        rebuild=rebuild_feature_stages,
     )
 
     sink_parquet_stage(
-        DAILY_FEATURES_PATH,
+        daily_features_path,
         build_daily_features_lf(tx_lf),
-        rebuild=REBUILD_FEATURE_STAGES,
+        rebuild=rebuild_feature_stages,
     )
 
     sink_parquet_stage(
-        CATEGORY_FEATURES_PATH,
+        category_features_path,
         build_category_features_lf(
             tx_lf=tx_lf,
             top_category_values=top_category_values,
             category_share_name_map=category_share_name_map,
         ),
-        rebuild=REBUILD_FEATURE_STAGES,
+        rebuild=rebuild_feature_stages,
     )
 
     sink_parquet_stage(
-        MCC_FEATURES_PATH,
+        mcc_features_path,
         build_mcc_features_lf(
             tx_lf=tx_lf,
             top_mcc_values=top_mcc_values,
             mcc_bucket_values=mcc_bucket_values,
             mcc_share_name_map=mcc_share_name_map,
         ),
-        rebuild=REBUILD_FEATURE_STAGES,
+        rebuild=rebuild_feature_stages,
     )
 
     sink_parquet_stage(
-        MERCHANT_FEATURES_PATH,
+        merchant_features_path,
         build_merchant_features_lf(tx_lf),
-        rebuild=REBUILD_FEATURE_STAGES,
+        rebuild=rebuild_feature_stages,
     )
 
 
-def assemble_final_dataset() -> None:
-    if FINAL_PARQUET_PATH.exists() and not REBUILD_FINAL_DATASET:
+def add_deterministic_user_traits(user_features_pl: pl.DataFrame) -> pl.DataFrame:
+    result = _prepare_trait_percentiles(user_features_pl)
+    result = _compute_trait_scores(result)
+    result = _resolve_trait_conflicts(result)
+    result = _build_trait_tag_columns(result)
+
+    trait_internal_columns = [
+        TRAIT_INTERNAL_ELIGIBLE_COLUMN,
+        TRAIT_INTERNAL_SUPPORT_WEIGHT_COLUMN,
+        *[_trait_percentile_column_name(feature_name) for feature_name in TRAIT_PERCENTILE_SOURCE_FEATURES],
+    ]
+    columns_to_drop = [column_name for column_name in trait_internal_columns if column_name in result.columns]
+    if columns_to_drop:
+        result = result.drop(columns_to_drop)
+    return result
+
+
+def _prepare_trait_percentiles(user_features_pl: pl.DataFrame) -> pl.DataFrame:
+    result = user_features_pl.clone()
+
+    for feature_name in TRAIT_PERCENTILE_SOURCE_FEATURES:
+        if feature_name not in result.columns:
+            result = result.with_columns(pl.lit(None, dtype=pl.Float64).alias(feature_name))
+
+    result = result.with_columns([
+        pl.col(feature_name).cast(pl.Float64, strict=False).alias(feature_name)
+        for feature_name in TRAIT_PERCENTILE_SOURCE_FEATURES
+    ])
+
+    result = result.with_columns(
+        (
+            (pl.col("txn_cnt").fill_null(0) >= TRAIT_ELIGIBILITY_MIN_TXN_CNT)
+            & (pl.col("active_days_cnt").fill_null(0) >= TRAIT_ELIGIBILITY_MIN_ACTIVE_DAYS_CNT)
+            & (pl.col("activity_span_days").fill_null(0) >= TRAIT_ELIGIBILITY_MIN_ACTIVITY_SPAN_DAYS)
+        ).alias(TRAIT_INTERNAL_ELIGIBLE_COLUMN),
+        pl.min_horizontal(
+            pl.lit(1.0),
+            _sqrt_non_negative_ratio_expr("txn_cnt", TRAIT_SUPPORT_TXN_REFERENCE),
+            _sqrt_non_negative_ratio_expr("active_days_cnt", TRAIT_SUPPORT_ACTIVE_DAYS_REFERENCE),
+            _sqrt_non_negative_ratio_expr("activity_span_days", TRAIT_SUPPORT_ACTIVITY_SPAN_REFERENCE),
+        ).alias(TRAIT_INTERNAL_SUPPORT_WEIGHT_COLUMN),
+    )
+
+    percentile_exprs = [
+        _build_percentile_expr(feature_name=feature_name, eligible_column=TRAIT_INTERNAL_ELIGIBLE_COLUMN)
+        for feature_name in TRAIT_PERCENTILE_SOURCE_FEATURES
+    ]
+    return result.with_columns(percentile_exprs)
+
+
+def _compute_trait_scores(user_features_pl: pl.DataFrame) -> pl.DataFrame:
+    percentile_expr_by_feature = {
+        feature_name: pl.col(_trait_percentile_column_name(feature_name))
+        for feature_name in TRAIT_PERCENTILE_SOURCE_FEATURES
+    }
+
+    explorer_raw_expr = _composite_mean_expr(
+        [percentile_expr_by_feature[feature_name] for feature_name in TRAIT_EXPLORER_COMPONENTS],
+        min_valid_components=TRAIT_MIN_VALID_COMPONENTS_DEFAULT,
+    )
+    routine_raw_expr = _composite_mean_expr(
+        [
+            pl.when(percentile_expr_by_feature[feature_name].is_not_null())
+            .then(1.0 - percentile_expr_by_feature[feature_name])
+            .otherwise(None)
+            for feature_name in TRAIT_EXPLORER_COMPONENTS
+        ],
+        min_valid_components=TRAIT_MIN_VALID_COMPONENTS_DEFAULT,
+    )
+    out_of_home_raw_expr = _composite_mean_expr(
+        [percentile_expr_by_feature[feature_name] for feature_name in TRAIT_OUT_OF_HOME_COMPONENTS],
+        min_valid_components=TRAIT_MIN_VALID_COMPONENTS_OUT_OF_HOME,
+    )
+    traveler_raw_expr = _composite_mean_expr(
+        [percentile_expr_by_feature[feature_name] for feature_name in TRAIT_TRAVEL_COMPONENTS],
+        min_valid_components=TRAIT_MIN_VALID_COMPONENTS_TRAVELER,
+    )
+    traveler_signal_expr = (
+        pl.sum_horizontal([
+            pl.when(pl.col(feature_name).fill_null(0.0) > 0.0).then(1).otherwise(0)
+            for feature_name in TRAIT_TRAVEL_COMPONENTS
+        ]) > 0
+    )
+
+    return user_features_pl.with_columns(
+        _trait_score_expr(_upper_tail_score_expr(percentile_expr_by_feature["share_night_txn"]))
+        .alias(TRAIT_SCORE_COLUMN_BY_CODE["owl"]),
+        _trait_score_expr(_lower_tail_score_expr(percentile_expr_by_feature["share_night_txn"]))
+        .alias(TRAIT_SCORE_COLUMN_BY_CODE["early_bird"]),
+        _trait_score_expr(_upper_tail_score_expr(percentile_expr_by_feature["share_weekend_txn"]))
+        .alias(TRAIT_SCORE_COLUMN_BY_CODE["weekend_lover"]),
+        _trait_score_expr(_upper_tail_score_expr(explorer_raw_expr)).alias(TRAIT_SCORE_COLUMN_BY_CODE["explorer"]),
+        _trait_score_expr(_upper_tail_score_expr(routine_raw_expr)).alias(TRAIT_SCORE_COLUMN_BY_CODE["routine"]),
+        _trait_score_expr(_upper_tail_score_expr(out_of_home_raw_expr))
+        .alias(TRAIT_SCORE_COLUMN_BY_CODE["out_of_home_leisure"]),
+        _trait_score_expr(
+            pl.when(traveler_signal_expr)
+            .then(_upper_tail_score_expr(traveler_raw_expr))
+            .otherwise(0.0)
+        ).alias(TRAIT_SCORE_COLUMN_BY_CODE["traveler"]),
+    )
+
+
+def _resolve_trait_conflicts(user_features_pl: pl.DataFrame) -> pl.DataFrame:
+    owl_score_expr = pl.col(TRAIT_SCORE_COLUMN_BY_CODE["owl"]).fill_null(0.0)
+    early_bird_score_expr = pl.col(TRAIT_SCORE_COLUMN_BY_CODE["early_bird"]).fill_null(0.0)
+    explorer_score_expr = pl.col(TRAIT_SCORE_COLUMN_BY_CODE["explorer"]).fill_null(0.0)
+    routine_score_expr = pl.col(TRAIT_SCORE_COLUMN_BY_CODE["routine"]).fill_null(0.0)
+
+    return user_features_pl.with_columns(
+        pl.when(owl_score_expr >= early_bird_score_expr)
+        .then(owl_score_expr)
+        .otherwise(0.0)
+        .alias(TRAIT_SCORE_COLUMN_BY_CODE["owl"]),
+        pl.when(early_bird_score_expr > owl_score_expr)
+        .then(early_bird_score_expr)
+        .otherwise(0.0)
+        .alias(TRAIT_SCORE_COLUMN_BY_CODE["early_bird"]),
+        pl.when(explorer_score_expr >= routine_score_expr)
+        .then(explorer_score_expr)
+        .otherwise(0.0)
+        .alias(TRAIT_SCORE_COLUMN_BY_CODE["explorer"]),
+        pl.when(routine_score_expr > explorer_score_expr)
+        .then(routine_score_expr)
+        .otherwise(0.0)
+        .alias(TRAIT_SCORE_COLUMN_BY_CODE["routine"]),
+    )
+
+
+def _build_trait_tag_columns(user_features_pl: pl.DataFrame) -> pl.DataFrame:
+    score_struct_expr = pl.struct([
+        pl.col(TRAIT_SCORE_COLUMN_BY_CODE[trait_code])
+        for trait_code in TRAIT_INTERNAL_CODES
+    ])
+    return user_features_pl.with_columns(
+        score_struct_expr.map_elements(
+            _build_trait_internal_tags,
+            return_dtype=pl.Utf8,
+        ).alias("trait_tags_internal"),
+        score_struct_expr.map_elements(
+            _build_trait_display_tags,
+            return_dtype=pl.Utf8,
+        ).alias("trait_tags_display"),
+    )
+
+
+def _trait_percentile_column_name(feature_name: str) -> str:
+    return f"__trait_pct_{sanitize_token(feature_name)}"
+
+
+def _sqrt_non_negative_ratio_expr(column_name: str, reference_value: float) -> pl.Expr:
+    numeric_value_expr = pl.col(column_name).fill_null(0.0).cast(pl.Float64, strict=False)
+    return (
+        pl.when(numeric_value_expr > 0.0)
+        .then((numeric_value_expr / float(reference_value)).sqrt())
+        .otherwise(0.0)
+    )
+
+
+def _build_percentile_expr(*, feature_name: str, eligible_column: str) -> pl.Expr:
+    source_expr = (
+        pl.when(pl.col(eligible_column) & pl.col(feature_name).is_not_null())
+        .then(pl.col(feature_name).cast(pl.Float64, strict=False))
+        .otherwise(None)
+    )
+    rank_expr = source_expr.rank(method="average")
+    valid_count_expr = source_expr.is_not_null().sum()
+    percentile_expr = (
+        pl.when(rank_expr.is_not_null())
+        .then(
+            pl.when(valid_count_expr > 1)
+            .then((rank_expr - 1.0) / (valid_count_expr - 1.0))
+            .otherwise(0.0)
+        )
+        .otherwise(None)
+    )
+    return (
+        pl.when(percentile_expr.is_not_null())
+        .then(_clamp_0_1_expr(percentile_expr))
+        .otherwise(None)
+        .alias(_trait_percentile_column_name(feature_name))
+    )
+
+
+def _composite_mean_expr(component_exprs: list[pl.Expr], *, min_valid_components: int) -> pl.Expr:
+    valid_count_expr = pl.sum_horizontal([
+        pl.when(component_expr.is_not_null()).then(1).otherwise(0)
+        for component_expr in component_exprs
+    ]).cast(pl.Float64)
+    value_sum_expr = pl.sum_horizontal([
+        pl.when(component_expr.is_not_null()).then(component_expr).otherwise(0.0)
+        for component_expr in component_exprs
+    ])
+    return (
+        pl.when(valid_count_expr >= float(min_valid_components))
+        .then(value_sum_expr / valid_count_expr)
+        .otherwise(None)
+    )
+
+
+def _upper_tail_score_expr(percentile_expr: pl.Expr) -> pl.Expr:
+    return _clamp_0_1_expr((percentile_expr - TRAIT_UPPER_TAIL_START) / TRAIT_TAIL_WIDTH)
+
+
+def _lower_tail_score_expr(percentile_expr: pl.Expr) -> pl.Expr:
+    return _clamp_0_1_expr((TRAIT_LOWER_TAIL_END - percentile_expr) / TRAIT_TAIL_WIDTH)
+
+
+def _trait_score_expr(base_score_expr: pl.Expr) -> pl.Expr:
+    support_weight_expr = pl.col(TRAIT_INTERNAL_SUPPORT_WEIGHT_COLUMN).fill_null(0.0)
+    return (
+        pl.when(pl.col(TRAIT_INTERNAL_ELIGIBLE_COLUMN))
+        .then(_clamp_0_1_expr(base_score_expr * support_weight_expr))
+        .otherwise(0.0)
+    )
+
+
+def _clamp_0_1_expr(value_expr: pl.Expr) -> pl.Expr:
+    return pl.min_horizontal(
+        pl.lit(1.0),
+        pl.max_horizontal(pl.lit(0.0), value_expr),
+    )
+
+
+def _build_trait_internal_tags(score_row: dict[str, object]) -> str:
+    return _serialize_trait_tags([trait_code for trait_code, _, _ in _select_top_trait_payload(score_row)])
+
+
+def _build_trait_display_tags(score_row: dict[str, object]) -> str:
+    return _serialize_trait_tags([display_tag for _, display_tag, _ in _select_top_trait_payload(score_row)])
+
+
+def _select_top_trait_payload(score_row: dict[str, object] | None) -> list[tuple[str, str, float]]:
+    if not isinstance(score_row, dict):
+        return []
+
+    selected: list[tuple[str, str, float, int]] = []
+    for order_index, trait_code in enumerate(TRAIT_INTERNAL_CODES):
+        score_column = TRAIT_SCORE_COLUMN_BY_CODE[trait_code]
+        try:
+            score_value = float(score_row.get(score_column, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            score_value = 0.0
+        if score_value < TRAIT_TAG_SCORE_THRESHOLD:
+            continue
+        selected.append((trait_code, TRAIT_DISPLAY_TAG_BY_CODE[trait_code], score_value, order_index))
+
+    selected.sort(key=lambda trait_payload: (-trait_payload[2], trait_payload[3]))
+    top_traits = selected[:TRAIT_TAG_MAX_COUNT]
+    return [
+        (trait_code, display_tag, score_value)
+        for trait_code, display_tag, score_value, _ in top_traits
+    ]
+
+
+def _serialize_trait_tags(tag_values: list[str]) -> str:
+    return json.dumps(tag_values, ensure_ascii=False, separators=(",", ":"))
+
+
+def assemble_final_dataset(
+    *,
+    final_parquet_path: Path = FINAL_PARQUET_PATH,
+    base_features_path: Path = BASE_FEATURES_PATH,
+    daily_features_path: Path = DAILY_FEATURES_PATH,
+    category_features_path: Path = CATEGORY_FEATURES_PATH,
+    mcc_features_path: Path = MCC_FEATURES_PATH,
+    merchant_features_path: Path = MERCHANT_FEATURES_PATH,
+    rebuild_final_dataset: bool = REBUILD_FINAL_DATASET,
+) -> None:
+    if final_parquet_path.exists() and not rebuild_final_dataset:
         return
 
     final_lf = (
-        pl.scan_parquet(BASE_FEATURES_PATH)
-        .join(pl.scan_parquet(DAILY_FEATURES_PATH), on="party_rk", how="left")
-        .join(pl.scan_parquet(CATEGORY_FEATURES_PATH), on="party_rk", how="left")
-        .join(pl.scan_parquet(MCC_FEATURES_PATH), on="party_rk", how="left")
-        .join(pl.scan_parquet(MERCHANT_FEATURES_PATH), on="party_rk", how="left")
+        pl.scan_parquet(base_features_path)
+        .join(pl.scan_parquet(daily_features_path), on="party_rk", how="left")
+        .join(pl.scan_parquet(category_features_path), on="party_rk", how="left")
+        .join(pl.scan_parquet(mcc_features_path), on="party_rk", how="left")
+        .join(pl.scan_parquet(merchant_features_path), on="party_rk", how="left")
         .with_columns(
             weekday_name_expr("dominant_weekday_num", "dominant_weekday"),
             pl.when(pl.col("txn_cnt") > 0).then(pl.col("unique_merchant_cnt") / pl.col("txn_cnt")).otherwise(0.0).alias("merchant_diversity_ratio"),
@@ -598,7 +880,10 @@ def assemble_final_dataset() -> None:
         )
     )
 
-    sink_parquet(FINAL_PARQUET_PATH, final_lf)
+    final_df = collect_stream(final_lf)
+    final_df = add_deterministic_user_traits(final_df)
+    final_parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    final_df.write_parquet(final_parquet_path)
 
 
 def validate_final_dataset(user_features_pl: pl.DataFrame) -> None:
@@ -631,30 +916,92 @@ def validate_final_dataset(user_features_pl: pl.DataFrame) -> None:
             raise ValueError(f"Final dataset validation failed: {check_name}")
 
 
-def save_final_outputs(user_features_pl: pl.DataFrame) -> None:
-    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-    user_features_pl.write_parquet(FINAL_PARQUET_PATH)
-    user_features_pl.write_csv(FINAL_CSV_PATH)
+def save_final_outputs(
+    user_features_pl: pl.DataFrame,
+    *,
+    final_parquet_path: Path = FINAL_PARQUET_PATH,
+    final_csv_path: Path = FINAL_CSV_PATH,
+) -> None:
+    final_parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    final_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    user_features_pl.write_parquet(final_parquet_path)
+    user_features_pl.write_csv(final_csv_path)
+
+
+def build_unique_user_ids_frame(user_features_pl: pl.DataFrame) -> pl.DataFrame:
+    return (
+        user_features_pl
+        .select(pl.col("party_rk").alias("user_id"))
+        .drop_nulls()
+        .unique()
+        .sort("user_id")
+    )
+
+
+def run_pipeline(
+    *,
+    intermediate_dir: Path = INTERMEDIATE_DIR,
+    features_dir: Path = FEATURES_DIR,
+    tx_layer_path: Path = TX_LAYER_PATH,
+    base_features_path: Path = BASE_FEATURES_PATH,
+    daily_features_path: Path = DAILY_FEATURES_PATH,
+    category_features_path: Path = CATEGORY_FEATURES_PATH,
+    mcc_features_path: Path = MCC_FEATURES_PATH,
+    merchant_features_path: Path = MERCHANT_FEATURES_PATH,
+    final_parquet_path: Path = FINAL_PARQUET_PATH,
+    final_csv_path: Path = FINAL_CSV_PATH,
+    rebuild_tx_layer: bool = REBUILD_TX_LAYER,
+    rebuild_feature_stages: bool = REBUILD_FEATURE_STAGES,
+    rebuild_final_dataset: bool = REBUILD_FINAL_DATASET,
+) -> pl.DataFrame:
+    final_parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    intermediate_dir.mkdir(parents=True, exist_ok=True)
+    features_dir.mkdir(parents=True, exist_ok=True)
+
+    csv_files = validate_inputs()
+    build_tx_layer(
+        csv_files,
+        tx_layer_path=tx_layer_path,
+        rebuild_tx_layer=rebuild_tx_layer,
+    )
+
+    tx_lf = pl.scan_parquet(tx_layer_path)
+    build_feature_stages(
+        tx_lf,
+        base_features_path=base_features_path,
+        daily_features_path=daily_features_path,
+        category_features_path=category_features_path,
+        mcc_features_path=mcc_features_path,
+        merchant_features_path=merchant_features_path,
+        rebuild_feature_stages=rebuild_feature_stages,
+    )
+    assemble_final_dataset(
+        final_parquet_path=final_parquet_path,
+        base_features_path=base_features_path,
+        daily_features_path=daily_features_path,
+        category_features_path=category_features_path,
+        mcc_features_path=mcc_features_path,
+        merchant_features_path=merchant_features_path,
+        rebuild_final_dataset=rebuild_final_dataset,
+    )
+
+    user_features_pl = pl.read_parquet(final_parquet_path)
+    validate_final_dataset(user_features_pl)
+    save_final_outputs(
+        user_features_pl,
+        final_parquet_path=final_parquet_path,
+        final_csv_path=final_csv_path,
+    )
+    return user_features_pl
 
 
 def run() -> None:
-    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-    INTERMEDIATE_DIR.mkdir(parents=True, exist_ok=True)
-    FEATURES_DIR.mkdir(parents=True, exist_ok=True)
-
-    csv_files = validate_inputs()
-    build_tx_layer(csv_files)
-
-    tx_lf = pl.scan_parquet(TX_LAYER_PATH)
-    build_feature_stages(tx_lf)
-    assemble_final_dataset()
-
-    user_features_pl = pl.read_parquet(FINAL_PARQUET_PATH)
-    validate_final_dataset(user_features_pl)
-    save_final_outputs(user_features_pl)
+    user_features_pl = run_pipeline()
 
     print(f"Parquet saved to: {FINAL_PARQUET_PATH.resolve()}")
     print(f"CSV saved to: {FINAL_CSV_PATH.resolve()}")
+    user_ids_pl = build_unique_user_ids_frame(user_features_pl)
+    print(f"User ids prepared: {user_ids_pl.height}")
 
 
 if __name__ == "__main__":

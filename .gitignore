@@ -16,5 +16,4 @@ generate_interactions.py
 !/data_out/user_features_all_1000.csv
 synthetic_interactions_run
 utils/
-.env
-!notebooks/data1_eda_scaling_clustering.ipynb
+tests/

@@ -1,26 +1,25 @@
 from datetime import datetime, timezone
-from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
-
-from ml.explanation import map_feature_impacts_to_labels
+import structlog
 from ml.config import settings
 from ml.services.recommendation_identity import generate_recommendation_id
 from ml.services.recommendation_runtime_config import (
     DEFAULT_RECOMMENDATION_RUNTIME_CONFIG,
 )
-from ml.services.recommendation_scoring import EnsembleWeights
 from ml.services.recommendation_serving import get_recommendation_cycle_state, get_recommendations_for_user
 from ml.services.recommendation_store import (
+    reset_recommendation_cycle,
     run_with_user_recommendation_lock,
     save_recommendation_group_in_session,
 )
 from ml.services.user_id import normalize_user_id
 
+log = structlog.get_logger(__name__)
 router = APIRouter(prefix="/recommendation", tags=["recommendation"])
 
 
@@ -35,6 +34,7 @@ async def recommendation(payload: RecommendationRequest) -> JSONResponse:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
+        log.exception("recommendation_request_failed")
         raise HTTPException(status_code=500, detail=f"Failed to process request: {exc}") from exc
 
     return JSONResponse(status_code=200, content=recommendations)
@@ -56,6 +56,29 @@ def _generate_recommendations_response(raw_user_id: str) -> list[dict[str, objec
             conf=conf,
             g_conf=g_conf,
         )
+        if result_df.empty:
+            cycle_state = get_recommendation_cycle_state(
+                actor_user_id=normalized_user_id,
+                stage=DEFAULT_RECOMMENDATION_RUNTIME_CONFIG.recommendation_stage,
+            )
+            if bool(cycle_state.get("is_exhausted", False)):
+                cycle_started_at = reset_recommendation_cycle(normalized_user_id)
+                log.info(
+                    "recommendation_cycle_reset",
+                    actor_user_id=normalized_user_id,
+                    cycle_started_at=cycle_started_at.isoformat(),
+                    reason="eligible_pool_exhausted",
+                    total_pool_count=int(cycle_state.get("total_pool_count", 0)),
+                    eligible_pool_count=int(cycle_state.get("eligible_pool_count", 0)),
+                    shown_eligible_count=int(cycle_state.get("shown_eligible_count", 0)),
+                )
+                result_df = get_recommendations_for_user(
+                    user_id=normalized_user_id,
+                    runtime_config=DEFAULT_RECOMMENDATION_RUNTIME_CONFIG,
+                    conf=conf,
+                    g_conf=g_conf,
+                )
+
         recommendation_id = generate_recommendation_id()
         shown_at = datetime.now(timezone.utc)
 
@@ -77,17 +100,14 @@ def _generate_recommendations_response(raw_user_id: str) -> list[dict[str, objec
                 continue
             seen_candidate_ids.add(normalized_candidate_id)
 
+            reasons = row.get("reasons")
+            if not isinstance(reasons, dict) or len(reasons) != 3:
+                continue
+
             recommendation_rows.append(
                 {
                     "candidate_user_id": normalized_candidate_id,
-                    "source_row": _build_quality_source_row_payload(
-                        source_row=row,
-                        request_id=recommendation_id,
-                        viewer_id=normalized_user_id,
-                        candidate_id=normalized_candidate_id,
-                        served_stage=served_stage,
-                        ensemble_weights=DEFAULT_RECOMMENDATION_RUNTIME_CONFIG.ensemble_weights,
-                    ),
+                    "source_row": row,
                 }
             )
             recommendations.append(
@@ -95,7 +115,7 @@ def _generate_recommendations_response(raw_user_id: str) -> list[dict[str, objec
                     "ml_recommendation_id": recommendation_id,
                     "user_id": normalized_user_id,
                     "candidate_user_id": normalized_candidate_id,
-                    "reasons": map_feature_impacts_to_labels(row.get("impactful_features")),
+                    "reasons": reasons,
                 }
             )
 
@@ -127,76 +147,3 @@ def _pick_first_not_none(*values):
             continue
         return value
     return None
-
-
-def _build_quality_source_row_payload(
-    *,
-    source_row: dict[str, Any],
-    request_id: str,
-    viewer_id: str,
-    candidate_id: str,
-    served_stage: str,
-    ensemble_weights: EnsembleWeights,
-) -> dict[str, Any]:
-    payload = dict(source_row)
-    payload["request_id"] = request_id
-    payload["viewer_id"] = viewer_id
-    payload["candidate_id"] = candidate_id
-    payload["served_stage"] = served_stage
-
-    payload["pred_proba_like"] = _to_nullable_float(payload.get("y_pred_like"))
-    payload["pred_proba_skip"] = _to_nullable_float(payload.get("y_pred_dislike"))
-    payload["pred_proba_block"] = _to_nullable_float(payload.get("y_pred_block"))
-    payload["pred_proba_chat"] = _to_nullable_float(payload.get("y_pred_match"))
-
-    model_version = str(ensemble_weights.version)
-    payload.setdefault("model_version", model_version)
-    payload.setdefault("reranker_version", model_version)
-    payload.setdefault("score_weights_version", model_version)
-    payload.setdefault(
-        "score_weights_json",
-        {
-            "w_like": float(ensemble_weights.w_like),
-            "w_skip": float(ensemble_weights.w_dislike),
-            "w_block": float(ensemble_weights.w_block),
-            "w_chat": float(ensemble_weights.w_match),
-        },
-    )
-
-    rerank_score = _to_nullable_float(payload.get("rerank_score"))
-    if rerank_score is None:
-        rerank_score = _compute_pred_score_from_probabilities(payload, ensemble_weights=ensemble_weights)
-    payload["pred_score"] = rerank_score
-    return payload
-
-
-def _compute_pred_score_from_probabilities(
-    source_row: dict[str, Any],
-    *,
-    ensemble_weights: EnsembleWeights,
-) -> float | None:
-    pred_like = _to_nullable_float(source_row.get("y_pred_like"))
-    pred_skip = _to_nullable_float(source_row.get("y_pred_dislike"))
-    pred_block = _to_nullable_float(source_row.get("y_pred_block"))
-    pred_chat = _to_nullable_float(source_row.get("y_pred_match"))
-    if pred_like is None and pred_skip is None and pred_block is None and pred_chat is None:
-        return None
-
-    return float(
-        (float(pred_like or 0.0) * float(ensemble_weights.w_like))
-        + (float(pred_chat or 0.0) * float(ensemble_weights.w_match))
-        + (float(pred_skip or 0.0) * float(ensemble_weights.w_dislike))
-        + (float(pred_block or 0.0) * float(ensemble_weights.w_block))
-    )
-
-
-def _to_nullable_float(raw_value: Any) -> float | None:
-    if raw_value is None:
-        return None
-    try:
-        parsed = float(raw_value)
-    except (TypeError, ValueError):
-        return None
-    if parsed != parsed:
-        return None
-    return parsed

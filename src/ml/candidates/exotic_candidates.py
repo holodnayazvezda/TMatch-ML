@@ -13,6 +13,8 @@ def get_exotic_candidates(request_or_n_people, search_bundle=None):
         return pd.DataFrame()
 
     search_bundle = transactions_candidates._get_search_bundle(search_bundle=search_bundle)
+    if not search_bundle:
+        return pd.DataFrame()
     output_df = search_bundle["output_df"]
     if output_df.empty:
         return output_df.copy()
@@ -68,26 +70,21 @@ def get_exotic_candidates(request_or_n_people, search_bundle=None):
         f"{actor_user_id or 'anonymous'}:{str(user_ids[int(candidate_index)])}:exotic"
         for candidate_index in selected_indices
     ]
-    support_weights = transactions_candidates._compute_support_weights_from_scores(
-        np.asarray(centroid_distances, dtype=float),
-        lower_is_better=True,
-    )
-    impactful_features, impactful_origins, impactful_seed_basis = (
-        transactions_candidates.build_impactful_features_for_candidate_ids(
-            query_user_id=actor_user_id,
-            candidate_user_ids=candidate_ids,
+    impactful_features = [
+        transactions_candidates._extract_seeded_impactful_features(
+            seed_value=seed_basis,
             top_k=impactful_feature_count,
-            search_bundle=search_bundle,
-            support_weights=support_weights,
-            seed_bases=seed_basis_values,
         )
-    )
+        for seed_basis in seed_basis_values
+    ]
     result_df.insert(0, "rank", np.arange(1, len(result_df) + 1, dtype=np.int32))
+    if "cluster_id" in result_df.columns:
+        result_df = result_df.drop(columns=["cluster_id"])
     result_df.insert(1, "cluster_id", np.asarray(selected_cluster_ids, dtype=np.int32))
     result_df.insert(2, "distance_euclidean", np.asarray(centroid_distances, dtype=float))
     result_df.insert(3, "impactful_features", impactful_features)
-    result_df["impactful_features_origin"] = impactful_origins
-    result_df["impactful_features_seed_basis"] = impactful_seed_basis
+    result_df["impactful_features_origin"] = "seeded_fallback"
+    result_df["impactful_features_seed_basis"] = seed_basis_values
     return result_df
  
 def _resolve_exotic_request(request_or_n_people):

@@ -8,17 +8,20 @@ from typing import Any
 
 from sqlalchemy import select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.engine import Connection
 from sqlalchemy.orm import Session
 
 from ml.infra.db.init_db import init_db
 from ml.infra.db.models import (
     Interaction,
+    MLRecommendationCycleState,
     MLRecommendationGroup,
     MLRecommendationImpression,
 )
-from ml.infra.db.session import SessionLocal
+from ml.infra.db.session import SessionLocal, engine
 from ml.services.interaction_ingestion import TRAINING_INTERACTION_ACTIONS
 from ml.services.recommendation_scoring import PREDICTION_COLUMN_BY_TARGET
+from ml.services.user_id import normalize_user_id
 
 GROUP_STATUS_PENDING = "pending"
 GROUP_STATUS_FINALIZED = "finalized"
@@ -66,7 +69,10 @@ def save_recommendation_group_in_session(
     if shown_timestamp is None:
         raise ValueError("shown_at must be a valid datetime")
 
-    normalized_actor_user_id = _normalize_required_string(actor_user_id, field_name="actor_user_id")
+    normalized_actor_user_id = _normalize_required_user_id(
+        actor_user_id,
+        field_name="actor_user_id",
+    )
     normalized_recommendation_id = _normalize_required_string(
         recommendation_id,
         field_name="ml_recommendation_id",
@@ -101,7 +107,7 @@ def save_recommendation_group_in_session(
 
     impression_payloads = []
     for recommendation_row in recommendation_rows:
-        candidate_user_id = _normalize_required_string(
+        candidate_user_id = _normalize_required_user_id(
             recommendation_row.get("candidate_user_id"),
             field_name="candidate_user_id",
         )
@@ -168,25 +174,32 @@ def run_with_user_recommendation_lock(
     poll_wait_seconds: float,
     callback: Callable[[Session], Any],
 ) -> Any:
-    normalized_actor_user_id = _normalize_required_string(actor_user_id, field_name="actor_user_id")
+    normalized_actor_user_id = _normalize_required_user_id(
+        actor_user_id,
+        field_name="actor_user_id",
+    )
     init_db()
 
-    with SessionLocal() as session:
-        _acquire_user_recommendation_lock(session, normalized_actor_user_id)
+    with engine.connect() as lock_connection:
+        _acquire_user_recommendation_lock(lock_connection, normalized_actor_user_id)
         try:
-            with session.begin():
-                pending_group_ids = _list_pending_group_ids_for_user_in_session(session, normalized_actor_user_id)
-
-            if pending_group_ids:
-                time.sleep(max(float(poll_wait_seconds), 0.0))
+            with SessionLocal() as session:
                 with session.begin():
-                    unresolved_group_ids = _list_pending_group_ids_for_user_in_session(session, normalized_actor_user_id)
-                    if unresolved_group_ids:
-                        discard_groups_in_session(session, unresolved_group_ids)
+                    pending_group_ids = _list_pending_group_ids_for_user_in_session(session, normalized_actor_user_id)
 
-            return callback(session)
+                if pending_group_ids:
+                    time.sleep(max(float(poll_wait_seconds), 0.0))
+                    with session.begin():
+                        unresolved_group_ids = _list_pending_group_ids_for_user_in_session(
+                            session,
+                            normalized_actor_user_id,
+                        )
+                        if unresolved_group_ids:
+                            discard_groups_in_session(session, unresolved_group_ids)
+
+                return callback(session)
         finally:
-            _release_user_recommendation_lock(session, normalized_actor_user_id)
+            _release_user_recommendation_lock(lock_connection, normalized_actor_user_id)
 
 
 def get_pending_group_for_user(actor_user_id: str) -> dict[str, Any] | None:
@@ -197,7 +210,10 @@ def get_pending_group_for_user(actor_user_id: str) -> dict[str, Any] | None:
 
 
 def get_pending_group_for_user_in_session(session: Session, actor_user_id: str) -> dict[str, Any] | None:
-    normalized_actor_user_id = _normalize_required_string(actor_user_id, field_name="actor_user_id")
+    normalized_actor_user_id = _normalize_required_user_id(
+        actor_user_id,
+        field_name="actor_user_id",
+    )
     stmt = (
         select(MLRecommendationGroup)
         .where(
@@ -447,47 +463,6 @@ def get_train_rows(
         ]
 
 
-def get_recommendation_quality_rows(
-    limit: int | None = None,
-    *,
-    served_stages: Sequence[str] | None = None,
-    include_pending: bool = True,
-) -> list[dict[str, Any]]:
-    init_db()
-    stmt = (
-        select(MLRecommendationImpression, MLRecommendationGroup)
-        .join(
-            MLRecommendationGroup,
-            MLRecommendationGroup.ml_recommendation_id == MLRecommendationImpression.ml_recommendation_id,
-        )
-        .order_by(
-            MLRecommendationImpression.shown_at.desc(),
-            MLRecommendationImpression.ml_recommendation_id.desc(),
-            MLRecommendationImpression.actor_user_id.asc(),
-            MLRecommendationImpression.candidate_user_id.asc(),
-        )
-    )
-
-    if not include_pending:
-        stmt = stmt.where(
-            MLRecommendationGroup.group_status == GROUP_STATUS_FINALIZED,
-            MLRecommendationImpression.row_status == ROW_STATUS_FINALIZED,
-        )
-
-    normalized_served_stages = _normalize_non_empty_strings(served_stages or [])
-    if normalized_served_stages:
-        stmt = stmt.where(MLRecommendationGroup.served_stage.in_(normalized_served_stages))
-    if limit is not None and limit > 0:
-        stmt = stmt.limit(int(limit))
-
-    with SessionLocal() as session:
-        rows = session.execute(stmt).all()
-        return [
-            _serialize_quality_impression(impression_row, group_row)
-            for impression_row, group_row in rows
-        ]
-
-
 def reset_recommendation_cycle(
     actor_user_id: str,
     *,
@@ -611,6 +586,8 @@ def _build_feature_snapshot(source_row_json: dict[str, Any]) -> dict[str, Any]:
         "impactful_features",
         "rerank_score",
         "feature_snapshot",
+        "reasons",
+        "already_shown",
         *PREDICTION_COLUMN_BY_TARGET.values(),
     }
     result = {
@@ -624,6 +601,8 @@ def _build_feature_snapshot(source_row_json: dict[str, Any]) -> dict[str, Any]:
             "from_interaction": bool(source_row_json.get("retrieval_tx_interaction_is_candidate", 0)),
             "from_exotic": bool(source_row_json.get("retrieval_exotic_is_candidate", 0)),
             "from_popularity": bool(source_row_json.get("retrieval_popularity_is_candidate", 0)),
+            "impactful_features_origin": source_row_json.get("impactful_features_origin"),
+            "impactful_features_seed_basis": source_row_json.get("impactful_features_seed_basis"),
             "retrieval_primary_source": source_row_json.get("retrieval_primary_source"),
             "retrieval_sources_count": source_row_json.get("retrieval_sources_count"),
             "retrieval_sources": source_row_json.get("retrieval_sources"),
@@ -705,64 +684,6 @@ def _serialize_impression(
     }
 
 
-def _serialize_quality_impression(
-    impression_row: MLRecommendationImpression,
-    group_row: MLRecommendationGroup | None = None,
-) -> dict[str, Any]:
-    source_row_json = _to_json_safe(impression_row.source_row_json)
-    if not isinstance(source_row_json, dict):
-        source_row_json = {}
-
-    label_matured = bool(
-        impression_row.row_status == ROW_STATUS_FINALIZED
-        and (group_row is None or group_row.group_status == GROUP_STATUS_FINALIZED)
-    )
-    model_version = _pick_first_non_empty_string(
-        source_row_json.get("model_version"),
-        source_row_json.get("reranker_model_version"),
-        source_row_json.get("score_weights_version"),
-    )
-    reranker_version = _pick_first_non_empty_string(
-        source_row_json.get("reranker_version"),
-        source_row_json.get("model_version"),
-        source_row_json.get("score_weights_version"),
-    )
-    pred_score = _to_nullable_float(
-        _pick_first_not_none(
-            source_row_json.get("pred_score"),
-            source_row_json.get("rerank_score"),
-            source_row_json.get("score"),
-        )
-    )
-
-    return {
-        "request_id": impression_row.ml_recommendation_id,
-        "viewer_id": impression_row.actor_user_id,
-        "candidate_id": impression_row.candidate_user_id,
-        "model_version": model_version,
-        "reranker_version": reranker_version,
-        "pred_proba_like": _to_nullable_float(impression_row.label_pred_like),
-        "pred_proba_skip": _to_nullable_float(impression_row.label_pred_dislike),
-        "pred_proba_block": _to_nullable_float(impression_row.label_pred_block),
-        "pred_proba_chat": _to_nullable_float(impression_row.label_pred_match),
-        "pred_score": pred_score,
-        "true_label_like": _to_nullable_float(impression_row.label_true_like),
-        "true_label_skip": _to_nullable_float(impression_row.label_true_dislike),
-        "true_label_block": _to_nullable_float(impression_row.label_true_block),
-        "true_label_chat": _to_nullable_float(impression_row.label_true_match),
-        "label_matured": label_matured,
-        "shown_at": impression_row.shown_at.isoformat() if impression_row.shown_at else None,
-        "last_interaction_at": (
-            impression_row.last_interaction_at.isoformat() if impression_row.last_interaction_at else None
-        ),
-        "row_status": impression_row.row_status,
-        "group_status": group_row.group_status if group_row is not None else None,
-        "served_stage": group_row.served_stage if group_row is not None else None,
-        "final_action": impression_row.final_action,
-        "source_row_json": source_row_json,
-    }
-
-
 def _to_nullable_float(raw_value: Any) -> float | None:
     if raw_value is None:
         return None
@@ -773,23 +694,6 @@ def _to_nullable_float(raw_value: Any) -> float | None:
     if parsed != parsed:
         return None
     return parsed
-
-
-def _pick_first_not_none(*values: Any) -> Any:
-    for value in values:
-        if value is not None:
-            return value
-    return None
-
-
-def _pick_first_non_empty_string(*values: Any) -> str | None:
-    for value in values:
-        if value is None:
-            continue
-        normalized_value = str(value).strip()
-        if normalized_value:
-            return normalized_value
-    return None
 
 
 def _to_aware_utc(raw_value: Any) -> datetime | None:
@@ -819,6 +723,13 @@ def _normalize_required_string(raw_value: Any, *, field_name: str) -> str:
     return normalized_value
 
 
+def _normalize_required_user_id(raw_value: Any, *, field_name: str) -> str:
+    normalized_value = normalize_user_id(raw_value, allow_hash=True)
+    if normalized_value is None:
+        raise ValueError(f"{field_name} must be a valid UUID.")
+    return normalized_value
+
+
 def _normalize_non_empty_strings(values: Iterable[Any]) -> list[str]:
     normalized_values: list[str] = []
     seen_values: set[str] = set()
@@ -827,6 +738,18 @@ def _normalize_non_empty_strings(values: Iterable[Any]) -> list[str]:
             continue
         normalized_value = str(raw_value).strip()
         if not normalized_value or normalized_value in seen_values:
+            continue
+        seen_values.add(normalized_value)
+        normalized_values.append(normalized_value)
+    return normalized_values
+
+
+def _normalize_non_empty_user_ids(values: Iterable[Any]) -> list[str]:
+    normalized_values: list[str] = []
+    seen_values: set[str] = set()
+    for raw_value in values:
+        normalized_value = normalize_user_id(raw_value, allow_hash=True)
+        if normalized_value is None or normalized_value in seen_values:
             continue
         seen_values.add(normalized_value)
         normalized_values.append(normalized_value)
@@ -856,25 +779,26 @@ def _to_json_safe(value: Any) -> Any:
     return value
 
 
-def _acquire_user_recommendation_lock(session: Session, actor_user_id: str) -> None:
+def _acquire_user_recommendation_lock(connection: Connection, actor_user_id: str) -> None:
     lock_key = _build_recommendation_lock_key(actor_user_id)
-    session.execute(
+    connection.execute(
         text("SELECT pg_advisory_lock(:lock_key)"),
         {"lock_key": lock_key},
     )
-    session.commit()
+    connection.commit()
 
 
-def _release_user_recommendation_lock(session: Session, actor_user_id: str) -> None:
+def _release_user_recommendation_lock(connection: Connection, actor_user_id: str) -> None:
     lock_key = _build_recommendation_lock_key(actor_user_id)
     try:
-        session.execute(
+        connection.execute(
             text("SELECT pg_advisory_unlock(:lock_key)"),
             {"lock_key": lock_key},
         )
-        session.commit()
+        connection.commit()
     except Exception:
-        session.rollback()
+        # unlock failure is non-fatal here because connection close will rollback and release resources
+        connection.rollback()
 
 
 def _build_recommendation_lock_key(actor_user_id: str) -> int:

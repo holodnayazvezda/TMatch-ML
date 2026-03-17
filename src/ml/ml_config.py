@@ -9,7 +9,7 @@ class RerankConfig:
     user_id: str | None = None
     top_n: int = 100
     ratios: list[float] = field(default_factory=lambda: [0.5, 0.0, 0.0, 0.5])
-    an_impactful_features: int = 3
+    an_impactful_features: int = 6
     retrieval_candidates_path: str | Path | None = None
     rerank_mode_1_model_path: str | Path | None = None
     rerank_mode_2_model_path: str | Path | None = None
@@ -18,3 +18,5 @@ class RerankConfig:
     rerank_target_model_paths: dict[int, dict[str, str | Path]] | None = None
     recommendation_stage: str = "stage_4"
     popularity_action_weights: dict[str, float] = field(default_factory=dict)
+    uncertainty_mean_score_threshold: float = 0.0
+    uncertainty_gap_threshold: float = 0.05

@@ -612,6 +612,45 @@ FEATURE_REASON_ALIASES = {
 }
 
 
+TRANSACTION_TRAIT_MAPPER = {
+    "share_night_txn": "NIGHT_OWL",
+    "share_morning_txn": "MORNING_PERSON",
+    "share_evening_txn": "EVENING_PERSON",
+    "share_weekend_txn": "WEEKEND_FAN",
+    "cat_share_книги": "BOOKS_LOVER",
+    "cat_share_рестораны": "RESTAURANT_REGULAR",
+    "cat_share_развлечения": "ENTERTAINMENT_FAN",
+    "cat_share_кино": "MOVIE_LOVER",
+    "cat_share_цветы": "FLOWER_APPRECIATOR",
+    "cat_share_животные": "PET_PARENT",
+    "cat_share_образование": "EDUCATION_ORIENTED",
+    "cat_share_фаст_фуд": "FASTFOOD_FAN",
+    "cat_share_спорттовары": "SPORTS_FAN",
+    "cat_share_авиабилеты": "AIR_TRAVELER",
+    "cat_share_ж_д_билеты": "RAIL_TRAVELER",
+    "cat_share_турагентства": "TRAVEL_PLANNER",
+}
+
+
+def get_transaction_trait_mapper() -> dict[str, str]:
+    return dict(TRANSACTION_TRAIT_MAPPER)
+
+
+def get_transaction_trait_code(feature_name: Any) -> str | None:
+    key = str(feature_name).strip()
+    if not key:
+        return None
+
+    resolved_feature_key = _resolve_feature_key(key)
+    if resolved_feature_key is None:
+        resolved_feature_key = key
+
+    trait_code = TRANSACTION_TRAIT_MAPPER.get(resolved_feature_key)
+    if trait_code is None:
+        return None
+    return str(trait_code).strip() or None
+
+
 def get_feature_mapper(feature_name: Any) -> str | None:
     key = str(feature_name).strip()
     if not key:
@@ -653,6 +692,41 @@ def map_feature_impacts_to_labels(raw_reasons: Any) -> dict[str, float]:
         if current is None or impact > current:
             labels_with_impacts[label] = impact
     return labels_with_impacts
+
+
+def build_exact_reasons(
+    raw_reasons: Any,
+    *,
+    exact_count: int = 3,
+) -> dict[str, float] | None:
+    if exact_count <= 0:
+        return {}
+
+    feature_impacts = _normalize_feature_impacts(raw_reasons)
+    sorted_feature_impacts = sorted(
+        feature_impacts.items(),
+        key=lambda item: (-float(item[1]), str(item[0])),
+    )
+
+    reasons: dict[str, float] = {}
+    for feature_name, impact in sorted_feature_impacts:
+        label = get_feature_mapper(feature_name)
+        if label is None or label in reasons:
+            continue
+        reasons[label] = float(impact)
+        if len(reasons) >= exact_count:
+            return reasons
+
+    fallback_score = _resolve_fallback_reason_score(reasons)
+    for mapper_value in get_reason_mapper_values():
+        if mapper_value in reasons:
+            continue
+        reasons[mapper_value] = fallback_score
+        fallback_score = round(max(fallback_score - 0.001, 0.0), 4)
+        if len(reasons) >= exact_count:
+            return reasons
+
+    return None
 
 
 def get_reason_mapper_values() -> list[str]:
@@ -721,3 +795,18 @@ def _normalize_feature_impacts(raw_reasons: Any) -> dict[str, float]:
         return {str(feature_name): 0.0 for feature_name in raw_reasons}
 
     return {str(raw_reasons): 0.0}
+
+
+def _resolve_fallback_reason_score(existing_reasons: dict[str, float]) -> float:
+    numeric_scores = [
+        float(score)
+        for score in existing_reasons.values()
+        if isinstance(score, int | float)
+    ]
+    if not numeric_scores:
+        return 0.05
+
+    min_score = min(numeric_scores)
+    if min_score <= 0:
+        return 0.0
+    return round(min_score / 2.0, 4)

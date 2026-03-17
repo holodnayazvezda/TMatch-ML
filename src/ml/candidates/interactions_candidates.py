@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+import pickle
 from pathlib import Path
 from threading import Lock
 
@@ -11,11 +11,11 @@ import structlog
 
 from core.data_config import Paths
 from ml.candidates import transactions_candidates
-from ml.services.merged_user_feature_snapshot import ensure_merged_user_feature_snapshot
-from ml.services.user_id import normalize_user_id
+from ml.services.serving_policy import log_lazy_rebuild_blocked
 
 DATA_PATH = Paths.merged_user_features_parquet_path
 INDEX_PATH = Paths.tx_interaction_hnsw_index_path
+SEARCH_BUNDLE_PATH = Paths.tx_interaction_search_bundle_path
 ID_COLUMN = transactions_candidates.ID_COLUMN
 EMPTY_RESULT_COLUMNS = ["rank", "distance_euclidean", "query_party_rk", "impactful_features", ID_COLUMN]
 
@@ -26,8 +26,13 @@ log: structlog.BoundLogger = structlog.get_logger(__name__)
 
 
 def warmup_search_bundle(config=None):
-    effective_config = transactions_candidates._to_candidate_config(config)
-    return _get_search_bundle(search_bundle=None, config=effective_config)
+    _ = transactions_candidates._to_candidate_config(config)
+    bundle = _get_search_bundle(search_bundle=None, config=config)
+    if bundle is None:
+        status_payload = get_search_bundle_artifact_status()
+        log.warning("tx_interaction_candidates_warmup_degraded", **status_payload)
+        return None
+    return bundle
 
 
 def get_interaction_candidates(user_id, config=transactions_candidates.CandidateConfig(), search_bundle=None):
@@ -113,139 +118,150 @@ def get_interaction_candidates(user_id, config=transactions_candidates.Candidate
 
     top_indices = filtered_indices[:result_limit]
     top_distances = filtered_distances[:result_limit]
-    support_weights = transactions_candidates._compute_support_weights_from_scores(
-        top_distances,
-        lower_is_better=True,
-    )
-    impactful_features = transactions_candidates._extract_impactful_features_batch(
-        query_vector=scaled_matrix[query_position],
-        candidate_matrix=scaled_matrix[top_indices],
-        feature_names=feature_names,
-        top_k=effective_config.an_impactful_features,
-        support_weights=support_weights,
-        tau=transactions_candidates.IMPACTFUL_FEATURE_SCORE_TAU,
-    )
+    impactful_features = [
+        transactions_candidates._extract_impactful_features(
+            query_vector=scaled_matrix[query_position],
+            candidate_vector=scaled_matrix[candidate_index],
+            feature_names=feature_names,
+            top_k=effective_config.an_impactful_features,
+        )
+        for candidate_index in top_indices
+    ]
 
     result_df = search_bundle["output_df"].iloc[top_indices].copy().reset_index(drop=True)
     result_df.insert(0, "rank", np.arange(1, len(result_df) + 1))
     result_df.insert(1, "distance_euclidean", top_distances.astype(float))
     result_df.insert(2, "query_party_rk", resolved_user_id)
     result_df.insert(3, "impactful_features", impactful_features)
+    result_df["impactful_features_origin"] = "vector_distance_contribution"
+    result_df["impactful_features_seed_basis"] = None
     return result_df
 
 
 def _get_search_bundle(search_bundle=None, config=None):
     if search_bundle is not None:
-        if "faiss_index" not in search_bundle and search_bundle.get("scaled_matrix") is not None:
-            search_bundle["faiss_index"] = _load_or_build_faiss_index(
-                scaled_matrix=search_bundle["scaled_matrix"],
-                config=config or transactions_candidates.CandidateConfig(),
-                dataset_path=Path(search_bundle.get("dataset_path", DATA_PATH)),
+        if "faiss_index" not in search_bundle:
+            log_lazy_rebuild_blocked(
+                source="tx_interaction",
+                reason="search_bundle_missing_faiss_index",
+                artifact_path=SEARCH_BUNDLE_PATH,
             )
+            return None
         return search_bundle
 
-    merged_path = ensure_merged_user_feature_snapshot()
-    if not merged_path.exists():
-        return None
-
-    dataset_mtime = merged_path.stat().st_mtime
-
     global _SEARCH_BUNDLE
-    if _SEARCH_BUNDLE is not None and _SEARCH_BUNDLE.get("dataset_mtime") == dataset_mtime:
+    if _SEARCH_BUNDLE is not None:
         return _SEARCH_BUNDLE
 
     with _SEARCH_LOCK:
-        if _SEARCH_BUNDLE is not None and _SEARCH_BUNDLE.get("dataset_mtime") == dataset_mtime:
+        if _SEARCH_BUNDLE is not None:
             return _SEARCH_BUNDLE
-
-        df = _load_merged_dataset(merged_path)
-        if df.empty:
-            _SEARCH_BUNDLE = {
-                "output_df": pd.DataFrame(columns=[ID_COLUMN]),
-                "scaled_matrix": np.empty((0, 0), dtype=np.float32),
-                "feature_names": np.asarray([], dtype=object),
-                "user_ids": np.asarray([], dtype=object),
-                "id_index": pd.Index([], name=ID_COLUMN, dtype="string"),
-                "dataset_path": str(merged_path),
-                "dataset_mtime": dataset_mtime,
-            }
-            return _SEARCH_BUNDLE
-
-        date_columns = _infer_merged_date_columns(df)
-        bundle = transactions_candidates.prepare_search_artifacts(df, date_columns=date_columns)
-        bundle["dataset_path"] = str(merged_path)
-        bundle["dataset_mtime"] = dataset_mtime
-        bundle["faiss_index"] = _load_or_build_faiss_index(
-            scaled_matrix=bundle["scaled_matrix"],
-            config=config or transactions_candidates.CandidateConfig(),
-            dataset_path=merged_path,
-        )
-        _SEARCH_BUNDLE = bundle
-
+        _SEARCH_BUNDLE = _load_prebuilt_search_bundle()
     return _SEARCH_BUNDLE
 
 
-def _load_merged_dataset(dataset_path: Path) -> pd.DataFrame:
-    df = pd.read_parquet(dataset_path)
-    df[ID_COLUMN] = df[ID_COLUMN].map(lambda raw_id: normalize_user_id(raw_id, allow_hash=True)).astype("string")
-    df = df[df[ID_COLUMN].notna()].copy()
-    return df
+def get_search_bundle_artifact_status() -> dict[str, object]:
+    bundle_path = Path(SEARCH_BUNDLE_PATH)
+    index_path = Path(INDEX_PATH)
+    if not bundle_path.exists() or not index_path.exists():
+        return {
+            "source": "tx_interaction",
+            "status": "missing",
+            "bundle_path": str(bundle_path),
+            "index_path": str(index_path),
+        }
+
+    try:
+        with bundle_path.open("rb") as input_stream:
+            payload = pickle.load(input_stream)
+    except Exception as exc:
+        return {
+            "source": "tx_interaction",
+            "status": "invalid",
+            "bundle_path": str(bundle_path),
+            "index_path": str(index_path),
+            "error": str(exc),
+        }
+
+    row_count = int(payload.get("output_df", pd.DataFrame()).shape[0])
+    latest_mtime = max(float(bundle_path.stat().st_mtime), float(index_path.stat().st_mtime))
+    artifact_age_seconds = max(0.0, pd.Timestamp.utcnow().timestamp() - latest_mtime)
+    return {
+        "source": "tx_interaction",
+        "status": "ready",
+        "bundle_path": str(bundle_path),
+        "index_path": str(index_path),
+        "row_count": row_count,
+        "artifact_age_seconds": round(artifact_age_seconds, 3),
+    }
 
 
-def _infer_merged_date_columns(df: pd.DataFrame) -> list[str]:
-    date_columns = []
-    for column in df.columns:
-        if column == ID_COLUMN:
-            continue
-        series = df[column]
-        if pd.api.types.is_datetime64_any_dtype(series):
-            date_columns.append(column)
-            continue
-        if not str(column).endswith(("_at", "_dttm")):
-            continue
-        coerced_series = pd.to_datetime(series, errors="coerce", utc=False)
-        if coerced_series.notna().any():
-            date_columns.append(column)
-    return date_columns
+def _load_prebuilt_search_bundle() -> dict[str, object] | None:
+    bundle_path = Path(SEARCH_BUNDLE_PATH)
+    index_path = Path(INDEX_PATH)
+    if not bundle_path.exists():
+        log_lazy_rebuild_blocked(
+            source="tx_interaction",
+            reason="prebuilt_bundle_missing",
+            artifact_path=bundle_path,
+        )
+        return None
+    if not index_path.exists():
+        log_lazy_rebuild_blocked(
+            source="tx_interaction",
+            reason="prebuilt_index_missing",
+            artifact_path=index_path,
+        )
+        return None
 
+    try:
+        with bundle_path.open("rb") as input_stream:
+            bundle = pickle.load(input_stream)
+    except Exception as exc:
+        log.warning(
+            "tx_interaction_candidates_bundle_load_failed",
+            bundle_path=str(bundle_path),
+            error=str(exc),
+        )
+        return None
 
-def _load_or_build_faiss_index(*, scaled_matrix, config, dataset_path: Path):
+    required_fields = {"output_df", "feature_names", "scaled_matrix", "user_ids", "id_index"}
+    if not required_fields.issubset(bundle):
+        missing_fields = sorted(required_fields.difference(bundle))
+        log.warning(
+            "tx_interaction_candidates_bundle_invalid",
+            bundle_path=str(bundle_path),
+            missing_fields=missing_fields,
+        )
+        return None
+
+    try:
+        index = faiss.read_index(str(index_path))
+    except Exception as exc:
+        log.warning(
+            "tx_interaction_candidates_index_load_failed",
+            index_path=str(index_path),
+            error=str(exc),
+        )
+        return None
+
+    scaled_matrix = np.asarray(bundle["scaled_matrix"])
     feature_count = int(scaled_matrix.shape[1]) if scaled_matrix.ndim == 2 else 0
     if feature_count <= 0:
-        raise ValueError("Merged snapshot does not contain any usable feature columns for FAISS.")
+        return None
+    if int(index.d) != feature_count or int(index.ntotal) != int(scaled_matrix.shape[0]):
+        log.warning(
+            "tx_interaction_candidates_index_shape_mismatch",
+            index_path=str(index_path),
+            index_dim=int(index.d),
+            feature_count=feature_count,
+            index_size=int(index.ntotal),
+            row_count=int(scaled_matrix.shape[0]),
+        )
+        return None
 
-    index_path = Path(INDEX_PATH)
-    if index_path.exists() and index_path.stat().st_mtime >= dataset_path.stat().st_mtime:
-        try:
-            index = faiss.read_index(str(index_path))
-            if int(index.d) == feature_count and int(index.ntotal) == int(scaled_matrix.shape[0]):
-                return index
-            log.warning(
-                "tx_interaction_candidates_index_stale_shape_mismatch",
-                index_path=str(index_path),
-                index_dim=int(index.d),
-                feature_count=feature_count,
-                index_size=int(index.ntotal),
-                row_count=int(scaled_matrix.shape[0]),
-            )
-        except Exception as exc:
-            log.warning(
-                "tx_interaction_candidates_index_load_failed",
-                index_path=str(index_path),
-                error=str(exc),
-            )
-
-    index_config = replace(
-        transactions_candidates._to_candidate_config(config),
-        topk_trans_sim=max(
-            int(getattr(config, "topk_inter_sim", 0) or 0),
-            int(getattr(config, "topk_trans_sim", 0) or 0),
-        ),
-    )
-    index = transactions_candidates.build_faiss_index(scaled_matrix, index_config)
-    index_path.parent.mkdir(parents=True, exist_ok=True)
-    faiss.write_index(index, str(index_path))
-    return index
+    bundle["faiss_index"] = index
+    return bundle
 
 
 def _empty_candidate_frame() -> pd.DataFrame:

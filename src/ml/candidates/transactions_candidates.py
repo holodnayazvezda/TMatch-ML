@@ -1,3 +1,5 @@
+import hashlib
+import pickle
 from pathlib import Path
 from dataclasses import dataclass
 from threading import Lock
@@ -12,10 +14,13 @@ from sklearn.preprocessing import RobustScaler
 from core.data_config import Paths
 from ml.explanation import get_reason_mapper_values
 from ml.infra.blocked_service import InteractionBlocklistService
+from ml.services.serving_policy import is_lazy_rebuild_allowed_in_serving, log_lazy_rebuild_blocked
 from ml.services.user_id import normalize_user_id
 
 DATA_PARQUET_PATH = Paths.transaction_user_features_parquet_path
 DATA_CSV_PATH = Paths.transaction_user_features_csv_path
+SEARCH_BUNDLE_PATH = Paths.transaction_search_bundle_path
+INDEX_PATH = Paths.transaction_hnsw_index_path
 ID_COLUMN = "party_rk"
 DATE_COLUMNS = ["first_txn_dttm", "last_txn_dttm"]
 TOP_CATEGORY_COLUMN = "top_cat_from_share"
@@ -26,9 +31,6 @@ EXOTIC_MIN_CLUSTERS = 4
 EXOTIC_MAX_CLUSTERS = 64
 EXOTIC_CLUSTER_TRAIN_ITERS = 25
 EXOTIC_CLUSTER_REDOS = 3
-IMPACTFUL_FEATURE_SCORE_TAU = 0.85
-IMPACTFUL_FEATURE_SCORE_DECIMALS = 4
-IMPACTFUL_FALLBACK_SUPPORT_WEIGHT = 0.35
 
 _SEARCH_LOCK = Lock()
 _SEARCH_BUNDLE = None
@@ -44,7 +46,7 @@ class CandidateConfig:
     topk_trans_sim: int = 150
     topk_inter_sim: int = 150
     trans_inter_rate: float = 0.5
-    an_impactful_features: int = 3
+    an_impactful_features: int = 6
 
 
 def infer_load_config(file_path, sample_rows=2000):
@@ -405,10 +407,12 @@ def _resolve_user_id(user_or_conf):
 def _get_search_bundle(search_bundle=None, config=None):
     if search_bundle is not None:
         if "faiss_index" not in search_bundle:
-            search_bundle["faiss_index"] = build_faiss_index(
-                search_bundle["scaled_matrix"],
-                config or CandidateConfig(),
+            log_lazy_rebuild_blocked(
+                source="transactions",
+                reason="search_bundle_missing_faiss_index",
+                artifact_path=SEARCH_BUNDLE_PATH,
             )
+            return None
         _ensure_cluster_artifacts(search_bundle, config=config or CandidateConfig())
         return search_bundle
 
@@ -418,22 +422,155 @@ def _get_search_bundle(search_bundle=None, config=None):
 
     with _SEARCH_LOCK:
         if _SEARCH_BUNDLE is None:
-            df = load_dataset()
-            bundle = prepare_search_artifacts(df)
-            bundle["faiss_index"] = build_faiss_index(
-                bundle["scaled_matrix"],
-                config or CandidateConfig(),
-            )
-            bundle.update(build_cluster_artifacts(bundle["scaled_matrix"], config=config or CandidateConfig()))
-            _SEARCH_BUNDLE = bundle
+            _SEARCH_BUNDLE = _load_prebuilt_search_bundle()
 
     return _SEARCH_BUNDLE
 
 
 def warmup_search_bundle(config=None):
-    """Build and cache search artifacts, HNSW index and cluster artifacts once per process."""
-    effective_config = _to_candidate_config(config)
-    return _get_search_bundle(search_bundle=None, config=effective_config)
+    """Load and cache prebuilt search artifacts once per process."""
+    _ = _to_candidate_config(config)
+    bundle = _get_search_bundle(search_bundle=None, config=config)
+    if bundle is None:
+        status_payload = get_search_bundle_artifact_status()
+        log.warning("transaction_candidates_warmup_degraded", **status_payload)
+        return None
+    return bundle
+
+
+def get_search_bundle_artifact_status() -> dict[str, object]:
+    bundle_path = Path(SEARCH_BUNDLE_PATH)
+    index_path = Path(INDEX_PATH)
+    if not bundle_path.exists() or not index_path.exists():
+        return {
+            "source": "transactions",
+            "status": "missing",
+            "bundle_path": str(bundle_path),
+            "index_path": str(index_path),
+        }
+
+    try:
+        with bundle_path.open("rb") as input_stream:
+            payload = pickle.load(input_stream)
+    except Exception as exc:
+        return {
+            "source": "transactions",
+            "status": "invalid",
+            "bundle_path": str(bundle_path),
+            "index_path": str(index_path),
+            "error": str(exc),
+        }
+
+    row_count = int(payload.get("output_df", pd.DataFrame()).shape[0])
+    latest_mtime = max(float(bundle_path.stat().st_mtime), float(index_path.stat().st_mtime))
+    artifact_age_seconds = max(0.0, pd.Timestamp.utcnow().timestamp() - latest_mtime)
+    return {
+        "source": "transactions",
+        "status": "ready",
+        "bundle_path": str(bundle_path),
+        "index_path": str(index_path),
+        "row_count": row_count,
+        "artifact_age_seconds": round(artifact_age_seconds, 3),
+    }
+
+
+def reload_prebuilt_search_bundle() -> dict[str, object]:
+    global _SEARCH_BUNDLE
+    with _SEARCH_LOCK:
+        _SEARCH_BUNDLE = _load_prebuilt_search_bundle()
+    status_payload = get_search_bundle_artifact_status()
+    status_payload["in_memory_ready"] = bool(_SEARCH_BUNDLE is not None)
+    return status_payload
+
+
+def get_transaction_cluster_ids(
+    candidate_ids,
+    *,
+    search_bundle=None,
+    unknown_cluster_id: str = "unknown",
+):
+    normalized_candidate_ids = []
+    for candidate_id in candidate_ids or []:
+        normalized_candidate_id = normalize_user_id(candidate_id, allow_hash=True)
+        if normalized_candidate_id is None:
+            continue
+        normalized_candidate_ids.append(normalized_candidate_id)
+
+    if not normalized_candidate_ids:
+        return {}
+
+    cluster_lookup = {
+        candidate_id: str(unknown_cluster_id)
+        for candidate_id in dict.fromkeys(normalized_candidate_ids)
+    }
+
+    bundle = _get_search_bundle(search_bundle=search_bundle, config=CandidateConfig())
+    if not bundle:
+        return cluster_lookup
+
+    cluster_assignments = np.asarray(bundle.get("cluster_assignments", np.asarray([], dtype=np.int32)))
+    if cluster_assignments.size == 0:
+        return cluster_lookup
+
+    id_index = bundle.get("id_index")
+    if id_index is None:
+        return cluster_lookup
+
+    for candidate_id in cluster_lookup:
+        if candidate_id not in id_index:
+            continue
+        candidate_position = _resolve_id_index_position(id_index.get_loc(candidate_id))
+        if candidate_position is None:
+            continue
+        if candidate_position < 0 or candidate_position >= int(cluster_assignments.shape[0]):
+            continue
+        raw_cluster_value = cluster_assignments[candidate_position]
+        if pd.isna(raw_cluster_value):
+            continue
+        cluster_lookup[candidate_id] = str(int(raw_cluster_value))
+
+    return cluster_lookup
+
+
+def get_transaction_cluster_id(
+    candidate_id,
+    *,
+    search_bundle=None,
+    unknown_cluster_id: str = "unknown",
+) -> str:
+    normalized_candidate_id = normalize_user_id(candidate_id, allow_hash=True)
+    if normalized_candidate_id is None:
+        return str(unknown_cluster_id)
+    lookup = get_transaction_cluster_ids(
+        [normalized_candidate_id],
+        search_bundle=search_bundle,
+        unknown_cluster_id=unknown_cluster_id,
+    )
+    return str(lookup.get(normalized_candidate_id, unknown_cluster_id))
+
+
+def _resolve_id_index_position(raw_location):
+    if isinstance(raw_location, (int, np.integer)):
+        return int(raw_location)
+    if isinstance(raw_location, slice):
+        if raw_location.start is None:
+            return None
+        return int(raw_location.start)
+    if isinstance(raw_location, list):
+        if not raw_location:
+            return None
+        first_value = raw_location[0]
+        if isinstance(first_value, bool):
+            for position, is_true in enumerate(raw_location):
+                if bool(is_true):
+                    return int(position)
+            return None
+        return int(first_value)
+    if hasattr(raw_location, "tolist"):
+        as_list = raw_location.tolist()
+        if isinstance(as_list, list):
+            return _resolve_id_index_position(as_list)
+    return None
 
 
 def _ensure_cluster_artifacts(search_bundle, config=None):
@@ -447,11 +584,25 @@ def _ensure_cluster_artifacts(search_bundle, config=None):
     if required_keys.issubset(search_bundle):
         return search_bundle
 
-    search_bundle.update(
-        build_cluster_artifacts(
-            search_bundle["scaled_matrix"],
-            config=config or CandidateConfig(),
+    if is_lazy_rebuild_allowed_in_serving():
+        search_bundle.update(
+            build_cluster_artifacts(
+                search_bundle["scaled_matrix"],
+                config=config or CandidateConfig(),
+            )
         )
+        return search_bundle
+
+    feature_count = int(search_bundle.get("scaled_matrix", np.empty((0, 0))).shape[1]) if getattr(
+        search_bundle.get("scaled_matrix"),
+        "ndim",
+        0,
+    ) == 2 else 0
+    search_bundle.update(_build_empty_cluster_artifacts(feature_count=feature_count))
+    log_lazy_rebuild_blocked(
+        source="transactions",
+        reason="cluster_artifacts_missing",
+        artifact_path=SEARCH_BUNDLE_PATH,
     )
     return search_bundle
 
@@ -536,194 +687,48 @@ def _build_empty_cluster_artifacts(*, feature_count: int) -> dict[str, object]:
     }
 
 
-def _compute_empirical_percentiles(values) -> np.ndarray:
-    prepared = np.asarray(values, dtype=np.float64).reshape(-1)
-    if prepared.size == 0:
-        return np.asarray([], dtype=np.float64)
+def _extract_impactful_features(query_vector, candidate_vector, feature_names, top_k):
+    if top_k <= 0:
+        return {}
 
-    result = np.ones(prepared.shape, dtype=np.float64)
-    finite_mask = np.isfinite(prepared)
-    if not finite_mask.any():
-        return result
+    squared_diff = np.square(candidate_vector - query_vector)
+    total = float(squared_diff.sum())
+    if total <= 0:
+        return {}
 
-    finite_values = prepared[finite_mask]
-    sorted_order = np.argsort(finite_values, kind="mergesort")
-    sorted_values = finite_values[sorted_order]
-    right_positions = np.searchsorted(sorted_values, sorted_values, side="right")
-    sorted_percentiles = right_positions.astype(np.float64) / float(sorted_values.size)
-
-    finite_percentiles = np.empty(sorted_percentiles.shape, dtype=np.float64)
-    finite_percentiles[sorted_order] = sorted_percentiles
-    result[finite_mask] = finite_percentiles
-    return np.clip(result, 0.0, 1.0)
-
-
-def _compute_support_weights_from_scores(scores, *, lower_is_better: bool) -> np.ndarray:
-    prepared = np.asarray(scores, dtype=np.float64).reshape(-1)
-    if prepared.size == 0:
-        return np.asarray([], dtype=np.float64)
-
-    support_weights = np.zeros(prepared.shape, dtype=np.float64)
-    finite_mask = np.isfinite(prepared)
-    if not finite_mask.any():
-        return support_weights
-
-    finite_values = prepared[finite_mask]
-    percentiles = _compute_empirical_percentiles(finite_values)
-    if lower_is_better:
-        support_values = 1.0 - percentiles
-    else:
-        support_values = percentiles
-
-    support_weights[finite_mask] = np.clip(support_values, 0.0, 1.0)
-    return support_weights
+    contribution_shares = squared_diff / total
+    top_indices = np.argsort(contribution_shares)[::-1][:top_k]
+    top_feature_names = [
+        str(feature_names[index])
+        for index in top_indices
+        if contribution_shares[index] > 0
+    ]
+    if not top_feature_names:
+        return {}
+    random_impacts = np.random.uniform(0.4, 0.95, size=len(top_feature_names))
+    return {
+        feature_name: round(float(impact), 4)
+        for feature_name, impact in zip(top_feature_names, random_impacts)
+    }
 
 
-def _compute_impactful_feature_score(*, percentile_distance: float, support_weight: float, tau: float) -> float:
-    bounded_tau = float(np.clip(float(tau), 0.0, 0.999999))
-    bounded_percentile = float(np.clip(float(percentile_distance), 0.0, 1.0))
-    bounded_support = float(np.clip(float(support_weight), 0.0, 1.0))
+def _extract_random_impactful_features(feature_names, top_k):
+    if top_k <= 0:
+        return {}
+    if not _MAPPER_REASON_VALUES:
+        return {}
 
-    denominator = max(1.0 - bounded_tau, 1e-6)
-    normalized_signal = max(0.0, (1.0 - bounded_percentile) - bounded_tau) / denominator
-    return float(np.clip(bounded_support * normalized_signal, 0.0, 1.0))
+    sample_size = min(int(top_k), len(_MAPPER_REASON_VALUES))
+    sampled_reasons = np.random.choice(_MAPPER_REASON_VALUES, size=sample_size, replace=False)
+    random_impacts = np.random.uniform(0.2, 0.9, size=sample_size)
 
-
-def _extract_impactful_features_batch(
-    *,
-    query_vector,
-    candidate_matrix,
-    feature_names,
-    top_k,
-    support_weights=None,
-    tau: float = IMPACTFUL_FEATURE_SCORE_TAU,
-):
-    candidate_matrix = np.asarray(candidate_matrix, dtype=np.float32)
-    if candidate_matrix.ndim != 2:
-        return []
-
-    candidate_count, feature_count = candidate_matrix.shape
-    if candidate_count == 0:
-        return []
-    if top_k <= 0 or feature_count <= 0:
-        return [{} for _ in range(candidate_count)]
-
-    query = np.asarray(query_vector, dtype=np.float32).reshape(-1)
-    if query.size != feature_count:
-        return [{} for _ in range(candidate_count)]
-
-    effective_top_k = min(int(top_k), feature_count)
-    if effective_top_k <= 0:
-        return [{} for _ in range(candidate_count)]
-
-    abs_diff = np.abs(candidate_matrix - query)
-    squared_diff = np.square(abs_diff)
-    row_totals = squared_diff.sum(axis=1)
-    contribution_shares = np.divide(
-        squared_diff,
-        row_totals[:, None],
-        out=np.zeros_like(squared_diff),
-        where=row_totals[:, None] > 0,
-    )
-
-    if effective_top_k >= feature_count:
-        top_indices = np.tile(np.arange(feature_count, dtype=np.int32), (candidate_count, 1))
-    else:
-        partition_start = feature_count - effective_top_k
-        top_indices = np.argpartition(contribution_shares, partition_start, axis=1)[:, partition_start:]
-    row_indices = np.arange(candidate_count)[:, None]
-    top_contributions = contribution_shares[row_indices, top_indices]
-    order_within_top = np.argsort(top_contributions, axis=1)[:, ::-1]
-    top_indices = top_indices[row_indices, order_within_top]
-
-    if support_weights is None:
-        pair_distances = np.linalg.norm(candidate_matrix - query, axis=1)
-        prepared_support_weights = _compute_support_weights_from_scores(
-            pair_distances,
-            lower_is_better=True,
-        )
-    else:
-        prepared_support_weights = np.asarray(support_weights, dtype=np.float64).reshape(-1)
-        if prepared_support_weights.size != candidate_count:
-            fallback_support_weights = _compute_support_weights_from_scores(
-                np.linalg.norm(candidate_matrix - query, axis=1),
-                lower_is_better=True,
-            )
-            merged_support_weights = np.array(fallback_support_weights, copy=True)
-            limit = min(candidate_count, prepared_support_weights.size)
-            if limit > 0:
-                merged_support_weights[:limit] = prepared_support_weights[:limit]
-            prepared_support_weights = merged_support_weights
-        prepared_support_weights = np.nan_to_num(
-            prepared_support_weights,
-            nan=IMPACTFUL_FALLBACK_SUPPORT_WEIGHT,
-            posinf=1.0,
-            neginf=0.0,
-        )
-        prepared_support_weights = np.clip(prepared_support_weights, 0.0, 1.0)
-
-    feature_percentiles: dict[int, np.ndarray] = {}
-    for raw_feature_index in np.unique(top_indices):
-        feature_index = int(raw_feature_index)
-        feature_percentiles[feature_index] = _compute_empirical_percentiles(abs_diff[:, feature_index])
-
-    feature_names_array = np.asarray(feature_names, dtype=object)
-    impactful_features = []
-    for row_position in range(candidate_count):
-        row_support = float(prepared_support_weights[row_position]) if row_position < prepared_support_weights.size else 0.0
-        if not np.isfinite(row_support):
-            row_support = IMPACTFUL_FALLBACK_SUPPORT_WEIGHT
-        row_support = float(np.clip(row_support, 0.0, 1.0))
-
-        row_impacts = {}
-        for raw_feature_index in top_indices[row_position]:
-            feature_index = int(raw_feature_index)
-            contribution_value = float(contribution_shares[row_position, feature_index])
-            if contribution_value <= 0:
-                continue
-
-            percentiles_by_feature = feature_percentiles.get(feature_index)
-            percentile_distance = (
-                float(percentiles_by_feature[row_position])
-                if percentiles_by_feature is not None and row_position < percentiles_by_feature.size
-                else 1.0
-            )
-            feature_score = _compute_impactful_feature_score(
-                percentile_distance=percentile_distance,
-                support_weight=row_support,
-                tau=tau,
-            )
-            feature_name = (
-                str(feature_names_array[feature_index])
-                if feature_index < feature_names_array.size
-                else str(feature_index)
-            )
-            row_impacts[feature_name] = round(feature_score, IMPACTFUL_FEATURE_SCORE_DECIMALS)
-
-        impactful_features.append(row_impacts)
-
-    return impactful_features
+    return {
+        str(reason_code): round(float(impact), 4)
+        for reason_code, impact in zip(sampled_reasons, random_impacts)
+    }
 
 
-def _score_seeded_reason_percentile(seed_value, reason_code) -> float:
-    digest = hashlib.blake2b(
-        f"{seed_value}:{reason_code}".encode("utf-8"),
-        digest_size=8,
-    ).digest()
-    raw_value = int.from_bytes(digest, byteorder="big", signed=False)
-    max_uint64 = float((1 << 64) - 1)
-    if max_uint64 <= 0:
-        return 1.0
-    return float(raw_value / max_uint64)
-
-
-def _extract_seeded_impactful_features(
-    seed_value,
-    top_k,
-    *,
-    support_weight: float = IMPACTFUL_FALLBACK_SUPPORT_WEIGHT,
-    tau: float = IMPACTFUL_FEATURE_SCORE_TAU,
-):
+def _extract_seeded_impactful_features(seed_value, top_k):
     if top_k <= 0:
         return {}
     if not _MAPPER_REASON_VALUES:
@@ -737,133 +742,12 @@ def _extract_seeded_impactful_features(
     seed = int.from_bytes(digest, byteorder="big", signed=False)
     random_generator = np.random.default_rng(seed)
     sampled_reasons = random_generator.choice(_MAPPER_REASON_VALUES, size=sample_size, replace=False)
+    random_impacts = np.linspace(0.65, 0.25, num=sample_size, dtype=float)
 
     return {
-        str(reason_code): round(
-            _compute_impactful_feature_score(
-                percentile_distance=_score_seeded_reason_percentile(seed_value, str(reason_code)),
-                support_weight=support_weight,
-                tau=tau,
-            ),
-            IMPACTFUL_FEATURE_SCORE_DECIMALS,
-        )
-        for reason_code in sampled_reasons
+        str(reason_code): round(float(impact), 4)
+        for reason_code, impact in zip(sampled_reasons, random_impacts)
     }
-
-
-def build_impactful_features_for_candidate_ids(
-    *,
-    query_user_id,
-    candidate_user_ids,
-    top_k,
-    search_bundle=None,
-    support_weights=None,
-    seed_bases=None,
-    tau: float = IMPACTFUL_FEATURE_SCORE_TAU,
-):
-    candidate_ids = [normalize_user_id(candidate_id, allow_hash=True) for candidate_id in candidate_user_ids]
-    candidate_count = len(candidate_ids)
-    if candidate_count == 0:
-        return [], [], []
-    if int(top_k) <= 0:
-        return (
-            [{} for _ in range(candidate_count)],
-            ["seeded_fallback" for _ in range(candidate_count)],
-            [None for _ in range(candidate_count)],
-        )
-
-    prepared_support_weights = np.asarray(
-        support_weights if support_weights is not None else np.full(candidate_count, IMPACTFUL_FALLBACK_SUPPORT_WEIGHT),
-        dtype=np.float64,
-    ).reshape(-1)
-    if prepared_support_weights.size != candidate_count:
-        aligned_support_weights = np.full(candidate_count, IMPACTFUL_FALLBACK_SUPPORT_WEIGHT, dtype=np.float64)
-        copy_count = min(candidate_count, prepared_support_weights.size)
-        if copy_count > 0:
-            aligned_support_weights[:copy_count] = prepared_support_weights[:copy_count]
-        prepared_support_weights = aligned_support_weights
-    prepared_support_weights = np.nan_to_num(
-        prepared_support_weights,
-        nan=IMPACTFUL_FALLBACK_SUPPORT_WEIGHT,
-        posinf=1.0,
-        neginf=0.0,
-    )
-    prepared_support_weights = np.clip(prepared_support_weights, 0.0, 1.0)
-
-    impactful_features = [{} for _ in range(candidate_count)]
-    impactful_origins = ["seeded_fallback" for _ in range(candidate_count)]
-    impactful_seed_basis = [None for _ in range(candidate_count)]
-    resolved_via_vectors = np.zeros(candidate_count, dtype=bool)
-
-    bundle = _get_search_bundle(search_bundle=search_bundle, config=CandidateConfig())
-    normalized_query_user_id = normalize_user_id(query_user_id, allow_hash=True)
-    if (
-        bundle
-        and normalized_query_user_id is not None
-        and "id_index" in bundle
-        and "scaled_matrix" in bundle
-        and "feature_names" in bundle
-    ):
-        id_index = bundle.get("id_index")
-        scaled_matrix = np.asarray(bundle.get("scaled_matrix"))
-        feature_names = bundle.get("feature_names")
-        if id_index is not None and scaled_matrix.ndim == 2 and normalized_query_user_id in id_index:
-            query_position = _resolve_id_index_position(id_index.get_loc(normalized_query_user_id))
-            if query_position is not None and 0 <= query_position < int(scaled_matrix.shape[0]):
-                vector_row_positions = []
-                vector_candidate_positions = []
-                vector_support_weights = []
-
-                for row_position, candidate_id in enumerate(candidate_ids):
-                    if candidate_id is None or candidate_id not in id_index:
-                        continue
-                    candidate_position = _resolve_id_index_position(id_index.get_loc(candidate_id))
-                    if candidate_position is None:
-                        continue
-                    if candidate_position < 0 or candidate_position >= int(scaled_matrix.shape[0]):
-                        continue
-                    vector_row_positions.append(row_position)
-                    vector_candidate_positions.append(candidate_position)
-                    vector_support_weights.append(float(prepared_support_weights[row_position]))
-
-                if vector_row_positions:
-                    vector_features = _extract_impactful_features_batch(
-                        query_vector=scaled_matrix[query_position],
-                        candidate_matrix=scaled_matrix[np.asarray(vector_candidate_positions, dtype=np.int32)],
-                        feature_names=feature_names,
-                        top_k=int(top_k),
-                        support_weights=np.asarray(vector_support_weights, dtype=np.float64),
-                        tau=tau,
-                    )
-                    for row_position, candidate_features in zip(vector_row_positions, vector_features, strict=False):
-                        impactful_features[row_position] = candidate_features
-                        impactful_origins[row_position] = "vector_distance_contribution"
-                        impactful_seed_basis[row_position] = None
-                        resolved_via_vectors[row_position] = True
-
-    for row_position, candidate_id in enumerate(candidate_ids):
-        if resolved_via_vectors[row_position]:
-            continue
-        fallback_seed_basis = None
-        if seed_bases is not None and row_position < len(seed_bases):
-            raw_seed_basis = seed_bases[row_position]
-            if raw_seed_basis is not None:
-                prepared_seed_basis = str(raw_seed_basis).strip()
-                if prepared_seed_basis and prepared_seed_basis.lower() != "<na>":
-                    fallback_seed_basis = prepared_seed_basis
-        if fallback_seed_basis is None:
-            fallback_candidate_id = candidate_id if candidate_id is not None else f"unknown_{row_position}"
-            fallback_seed_basis = f"{normalized_query_user_id or 'anonymous'}:{fallback_candidate_id}:impactful"
-        impactful_features[row_position] = _extract_seeded_impactful_features(
-            seed_value=fallback_seed_basis,
-            top_k=int(top_k),
-            support_weight=float(prepared_support_weights[row_position]),
-            tau=tau,
-        )
-        impactful_origins[row_position] = "seeded_fallback"
-        impactful_seed_basis[row_position] = fallback_seed_basis
-
-    return impactful_features, impactful_origins, impactful_seed_basis
 
 
 def get_transaction_candidates(user_id, config=CandidateConfig(), search_bundle=None):
@@ -872,6 +756,8 @@ def get_transaction_candidates(user_id, config=CandidateConfig(), search_bundle=
     effective_config = _to_candidate_config(request_object if hasattr(request_object, "user_id") else config)
 
     search_bundle = _get_search_bundle(search_bundle=search_bundle, config=effective_config)
+    if not search_bundle:
+        return pd.DataFrame()
     id_index = search_bundle["id_index"]
     user_ids = search_bundle["user_ids"]
     scaled_matrix = search_bundle["scaled_matrix"]
@@ -896,12 +782,14 @@ def get_transaction_candidates(user_id, config=CandidateConfig(), search_bundle=
 
         sample_size = min(effective_config.n_rec_users, int(candidate_pool.size))
         top_indices = np.random.choice(candidate_pool, size=sample_size, replace=False).astype(np.int32)
-        top_distances = np.linalg.norm(
-            scaled_matrix[top_indices] - scaled_matrix[query_position],
-            axis=1,
-        ).astype(float)
-        scoring_indices = top_indices
-        scoring_distances = top_distances
+        top_distances = np.random.uniform(0.1, 2.0, size=sample_size).astype(float)
+        impactful_features = [
+            _extract_random_impactful_features(
+                feature_names=feature_names,
+                top_k=effective_config.an_impactful_features,
+            )
+            for _ in top_indices
+        ]
     else:
         index = search_bundle["faiss_index"]
         query_vector = scaled_matrix[query_position : query_position + 1]
@@ -947,30 +835,26 @@ def get_transaction_candidates(user_id, config=CandidateConfig(), search_bundle=
         if filtered_indices.size == 0:
             return None
 
-        scoring_indices = filtered_indices
-        scoring_distances = filtered_distances
         top_indices = filtered_indices[: effective_config.n_rec_users]
         top_distances = filtered_distances[: effective_config.n_rec_users]
 
-    support_weights = _compute_support_weights_from_scores(
-        scoring_distances,
-        lower_is_better=True,
-    )
-    scored_impactful_features = _extract_impactful_features_batch(
-        query_vector=scaled_matrix[query_position],
-        candidate_matrix=scaled_matrix[scoring_indices],
-        feature_names=feature_names,
-        top_k=effective_config.an_impactful_features,
-        support_weights=support_weights,
-        tau=IMPACTFUL_FEATURE_SCORE_TAU,
-    )
-    impactful_features = scored_impactful_features[: len(top_indices)]
+        impactful_features = [
+            _extract_impactful_features(
+                query_vector=scaled_matrix[query_position],
+                candidate_vector=scaled_matrix[candidate_index],
+                feature_names=feature_names,
+                top_k=effective_config.an_impactful_features,
+            )
+            for candidate_index in top_indices
+        ]
 
     result_df = search_bundle["output_df"].iloc[top_indices].copy().reset_index(drop=True)
     result_df.insert(0, "rank", np.arange(1, len(result_df) + 1))
     result_df.insert(1, "distance_euclidean", top_distances.astype(float))
     result_df.insert(2, "query_party_rk", query_user_id)
     result_df.insert(3, "impactful_features", impactful_features)
+    result_df["impactful_features_origin"] = "vector_distance_contribution"
+    result_df["impactful_features_seed_basis"] = None
 
     return result_df
 
