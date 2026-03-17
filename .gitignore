@@ -17,3 +17,4 @@ generate_interactions.py
 synthetic_interactions_run
 utils/
 .env
+!notebooks/data1_eda_scaling_clustering.ipynb
