@@ -483,6 +483,96 @@ def reload_prebuilt_search_bundle() -> dict[str, object]:
     return status_payload
 
 
+def get_transaction_cluster_ids(
+    candidate_ids,
+    *,
+    search_bundle=None,
+    unknown_cluster_id: str = "unknown",
+):
+    normalized_candidate_ids = []
+    for candidate_id in candidate_ids or []:
+        normalized_candidate_id = normalize_user_id(candidate_id, allow_hash=True)
+        if normalized_candidate_id is None:
+            continue
+        normalized_candidate_ids.append(normalized_candidate_id)
+
+    if not normalized_candidate_ids:
+        return {}
+
+    cluster_lookup = {
+        candidate_id: str(unknown_cluster_id)
+        for candidate_id in dict.fromkeys(normalized_candidate_ids)
+    }
+
+    bundle = _get_search_bundle(search_bundle=search_bundle, config=CandidateConfig())
+    if not bundle:
+        return cluster_lookup
+
+    cluster_assignments = np.asarray(bundle.get("cluster_assignments", np.asarray([], dtype=np.int32)))
+    if cluster_assignments.size == 0:
+        return cluster_lookup
+
+    id_index = bundle.get("id_index")
+    if id_index is None:
+        return cluster_lookup
+
+    for candidate_id in cluster_lookup:
+        if candidate_id not in id_index:
+            continue
+        candidate_position = _resolve_id_index_position(id_index.get_loc(candidate_id))
+        if candidate_position is None:
+            continue
+        if candidate_position < 0 or candidate_position >= int(cluster_assignments.shape[0]):
+            continue
+        raw_cluster_value = cluster_assignments[candidate_position]
+        if pd.isna(raw_cluster_value):
+            continue
+        cluster_lookup[candidate_id] = str(int(raw_cluster_value))
+
+    return cluster_lookup
+
+
+def get_transaction_cluster_id(
+    candidate_id,
+    *,
+    search_bundle=None,
+    unknown_cluster_id: str = "unknown",
+) -> str:
+    normalized_candidate_id = normalize_user_id(candidate_id, allow_hash=True)
+    if normalized_candidate_id is None:
+        return str(unknown_cluster_id)
+    lookup = get_transaction_cluster_ids(
+        [normalized_candidate_id],
+        search_bundle=search_bundle,
+        unknown_cluster_id=unknown_cluster_id,
+    )
+    return str(lookup.get(normalized_candidate_id, unknown_cluster_id))
+
+
+def _resolve_id_index_position(raw_location):
+    if isinstance(raw_location, (int, np.integer)):
+        return int(raw_location)
+    if isinstance(raw_location, slice):
+        if raw_location.start is None:
+            return None
+        return int(raw_location.start)
+    if isinstance(raw_location, list):
+        if not raw_location:
+            return None
+        first_value = raw_location[0]
+        if isinstance(first_value, bool):
+            for position, is_true in enumerate(raw_location):
+                if bool(is_true):
+                    return int(position)
+            return None
+        return int(first_value)
+    if hasattr(raw_location, "tolist"):
+        as_list = raw_location.tolist()
+        if isinstance(as_list, list):
+            return _resolve_id_index_position(as_list)
+    return None
+
+
 def _ensure_cluster_artifacts(search_bundle, config=None):
     required_keys = {
         "cluster_count",

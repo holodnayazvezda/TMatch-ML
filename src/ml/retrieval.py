@@ -169,6 +169,7 @@ def _prepare_source_frame(
     is_candidate_col = f"retrieval_{source_name}_is_candidate"
     rank_col = f"retrieval_{source_name}_rank"
     score_col = f"retrieval_{source_name}_score"
+    cluster_col = f"retrieval_{source_name}_cluster_id"
 
     if source_df.empty or limit <= 0:
         return pd.DataFrame(columns=[QUERY_ID_COLUMN, CANDIDATE_ID_COLUMN, is_candidate_col, rank_col, score_col])
@@ -232,6 +233,12 @@ def _prepare_source_frame(
         },
         index=source_df.index,
     )
+    source_cluster_column = _pick_first_existing_column(
+        source_df,
+        ["transaction_cluster_id", "cluster_id"],
+    )
+    if source_cluster_column is not None:
+        retrieval_flags_frame[cluster_col] = source_df[source_cluster_column].astype("string")
 
     source_feature_columns = [
         column
@@ -304,6 +311,23 @@ def _add_common_retrieval_features(merged: pd.DataFrame, source_names: list[str]
     merged["retrieval_primary_source"] = merged[rank_cols].idxmin(axis=1, skipna=True).str.replace(
         "retrieval_", "",
     ).str.replace("_rank", "")
+    cluster_cols = [
+        f"retrieval_{source_name}_cluster_id"
+        for source_name in source_names
+        if f"retrieval_{source_name}_cluster_id" in merged.columns
+    ]
+    if cluster_cols:
+        merged["transaction_cluster_id"] = (
+            merged[cluster_cols]
+            .astype("string")
+            .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
+            .bfill(axis=1)
+            .iloc[:, 0]
+        )
+    else:
+        merged["transaction_cluster_id"] = pd.NA
+    if "retrieval_exotic_cluster_id" in merged.columns:
+        merged["cluster_id"] = merged["retrieval_exotic_cluster_id"]
     merged["query_party_rk"] = merged[QUERY_ID_COLUMN]
     merged["party_rk"] = merged[CANDIDATE_ID_COLUMN]
     merged["rank"] = merged["retrieval_best_rank"]

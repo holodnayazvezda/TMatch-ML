@@ -1,3 +1,4 @@
+import json
 import re
 from pathlib import Path
 
@@ -53,6 +54,95 @@ SCHEMA_OVERRIDES = {
 
 hour_count_cols = [f"__hour_{hour:02d}_cnt" for hour in range(24)]
 weekday_count_cols = [f"__weekday_{weekday}_cnt" for weekday in range(1, 8)]
+
+TRAIT_INTERNAL_CODES = (
+    "owl",
+    "early_bird",
+    "weekend_lover",
+    "explorer",
+    "routine",
+    "out_of_home_leisure",
+    "traveler",
+)
+
+TRAIT_SCORE_COLUMN_BY_CODE = {
+    "owl": "trait_score_owl",
+    "early_bird": "trait_score_early_bird",
+    "weekend_lover": "trait_score_weekend_lover",
+    "explorer": "trait_score_explorer",
+    "routine": "trait_score_routine",
+    "out_of_home_leisure": "trait_score_out_of_home_leisure",
+    "traveler": "trait_score_traveler",
+}
+
+TRAIT_DISPLAY_TAG_BY_CODE = {
+    "owl": "сова",
+    "early_bird": "ранняя пташка",
+    "weekend_lover": "любит активные выходные",
+    "explorer": "любит новые места",
+    "routine": "предпочитает стабильный ритм",
+    "out_of_home_leisure": "любит досуг вне дома",
+    "traveler": "любит поездки",
+}
+
+TRAIT_PERCENTILE_SOURCE_FEATURES = [
+    "share_night_txn",
+    "share_weekend_txn",
+    "category_entropy",
+    "mcc_entropy",
+    "unique_merchant_cnt",
+    "merchant_diversity_ratio",
+    "category_diversity_ratio",
+    "mcc_diversity_ratio",
+    "cat_share_рестораны",
+    "cat_share_развлечения",
+    "cat_share_кино",
+    "cat_share_авиабилеты",
+    "cat_share_ж_д_билеты",
+    "cat_share_турагентства",
+    "cat_share_аренда_авто",
+]
+
+TRAIT_EXPLORER_COMPONENTS = [
+    "category_entropy",
+    "mcc_entropy",
+    "unique_merchant_cnt",
+    "merchant_diversity_ratio",
+    "category_diversity_ratio",
+    "mcc_diversity_ratio",
+]
+TRAIT_OUT_OF_HOME_COMPONENTS = [
+    "cat_share_рестораны",
+    "cat_share_развлечения",
+    "cat_share_кино",
+]
+TRAIT_TRAVEL_COMPONENTS = [
+    "cat_share_авиабилеты",
+    "cat_share_ж_д_билеты",
+    "cat_share_турагентства",
+    "cat_share_аренда_авто",
+]
+
+TRAIT_MIN_VALID_COMPONENTS_DEFAULT = 1
+TRAIT_MIN_VALID_COMPONENTS_OUT_OF_HOME = 2
+TRAIT_MIN_VALID_COMPONENTS_TRAVELER = 2
+
+TRAIT_ELIGIBILITY_MIN_TXN_CNT = 20
+TRAIT_ELIGIBILITY_MIN_ACTIVE_DAYS_CNT = 10
+TRAIT_ELIGIBILITY_MIN_ACTIVITY_SPAN_DAYS = 30
+
+TRAIT_SUPPORT_TXN_REFERENCE = 50.0
+TRAIT_SUPPORT_ACTIVE_DAYS_REFERENCE = 20.0
+TRAIT_SUPPORT_ACTIVITY_SPAN_REFERENCE = 90.0
+
+TRAIT_UPPER_TAIL_START = 0.85
+TRAIT_LOWER_TAIL_END = 0.15
+TRAIT_TAIL_WIDTH = 0.15
+
+TRAIT_TAG_SCORE_THRESHOLD = 0.35
+TRAIT_TAG_MAX_COUNT = 3
+TRAIT_INTERNAL_ELIGIBLE_COLUMN = "__traits_eligible"
+TRAIT_INTERNAL_SUPPORT_WEIGHT_COLUMN = "__trait_support_weight"
 
 
 def collect_stream(lf: pl.LazyFrame) -> pl.DataFrame:
@@ -504,6 +594,265 @@ def build_feature_stages(
     )
 
 
+def add_deterministic_user_traits(user_features_pl: pl.DataFrame) -> pl.DataFrame:
+    result = _prepare_trait_percentiles(user_features_pl)
+    result = _compute_trait_scores(result)
+    result = _resolve_trait_conflicts(result)
+    result = _build_trait_tag_columns(result)
+
+    trait_internal_columns = [
+        TRAIT_INTERNAL_ELIGIBLE_COLUMN,
+        TRAIT_INTERNAL_SUPPORT_WEIGHT_COLUMN,
+        *[_trait_percentile_column_name(feature_name) for feature_name in TRAIT_PERCENTILE_SOURCE_FEATURES],
+    ]
+    columns_to_drop = [column_name for column_name in trait_internal_columns if column_name in result.columns]
+    if columns_to_drop:
+        result = result.drop(columns_to_drop)
+    return result
+
+
+def _prepare_trait_percentiles(user_features_pl: pl.DataFrame) -> pl.DataFrame:
+    result = user_features_pl.clone()
+
+    for feature_name in TRAIT_PERCENTILE_SOURCE_FEATURES:
+        if feature_name not in result.columns:
+            result = result.with_columns(pl.lit(None, dtype=pl.Float64).alias(feature_name))
+
+    result = result.with_columns([
+        pl.col(feature_name).cast(pl.Float64, strict=False).alias(feature_name)
+        for feature_name in TRAIT_PERCENTILE_SOURCE_FEATURES
+    ])
+
+    result = result.with_columns(
+        (
+            (pl.col("txn_cnt").fill_null(0) >= TRAIT_ELIGIBILITY_MIN_TXN_CNT)
+            & (pl.col("active_days_cnt").fill_null(0) >= TRAIT_ELIGIBILITY_MIN_ACTIVE_DAYS_CNT)
+            & (pl.col("activity_span_days").fill_null(0) >= TRAIT_ELIGIBILITY_MIN_ACTIVITY_SPAN_DAYS)
+        ).alias(TRAIT_INTERNAL_ELIGIBLE_COLUMN),
+        pl.min_horizontal(
+            pl.lit(1.0),
+            _sqrt_non_negative_ratio_expr("txn_cnt", TRAIT_SUPPORT_TXN_REFERENCE),
+            _sqrt_non_negative_ratio_expr("active_days_cnt", TRAIT_SUPPORT_ACTIVE_DAYS_REFERENCE),
+            _sqrt_non_negative_ratio_expr("activity_span_days", TRAIT_SUPPORT_ACTIVITY_SPAN_REFERENCE),
+        ).alias(TRAIT_INTERNAL_SUPPORT_WEIGHT_COLUMN),
+    )
+
+    percentile_exprs = [
+        _build_percentile_expr(feature_name=feature_name, eligible_column=TRAIT_INTERNAL_ELIGIBLE_COLUMN)
+        for feature_name in TRAIT_PERCENTILE_SOURCE_FEATURES
+    ]
+    return result.with_columns(percentile_exprs)
+
+
+def _compute_trait_scores(user_features_pl: pl.DataFrame) -> pl.DataFrame:
+    percentile_expr_by_feature = {
+        feature_name: pl.col(_trait_percentile_column_name(feature_name))
+        for feature_name in TRAIT_PERCENTILE_SOURCE_FEATURES
+    }
+
+    explorer_raw_expr = _composite_mean_expr(
+        [percentile_expr_by_feature[feature_name] for feature_name in TRAIT_EXPLORER_COMPONENTS],
+        min_valid_components=TRAIT_MIN_VALID_COMPONENTS_DEFAULT,
+    )
+    routine_raw_expr = _composite_mean_expr(
+        [
+            pl.when(percentile_expr_by_feature[feature_name].is_not_null())
+            .then(1.0 - percentile_expr_by_feature[feature_name])
+            .otherwise(None)
+            for feature_name in TRAIT_EXPLORER_COMPONENTS
+        ],
+        min_valid_components=TRAIT_MIN_VALID_COMPONENTS_DEFAULT,
+    )
+    out_of_home_raw_expr = _composite_mean_expr(
+        [percentile_expr_by_feature[feature_name] for feature_name in TRAIT_OUT_OF_HOME_COMPONENTS],
+        min_valid_components=TRAIT_MIN_VALID_COMPONENTS_OUT_OF_HOME,
+    )
+    traveler_raw_expr = _composite_mean_expr(
+        [percentile_expr_by_feature[feature_name] for feature_name in TRAIT_TRAVEL_COMPONENTS],
+        min_valid_components=TRAIT_MIN_VALID_COMPONENTS_TRAVELER,
+    )
+    traveler_signal_expr = (
+        pl.sum_horizontal([
+            pl.when(pl.col(feature_name).fill_null(0.0) > 0.0).then(1).otherwise(0)
+            for feature_name in TRAIT_TRAVEL_COMPONENTS
+        ]) > 0
+    )
+
+    return user_features_pl.with_columns(
+        _trait_score_expr(_upper_tail_score_expr(percentile_expr_by_feature["share_night_txn"]))
+        .alias(TRAIT_SCORE_COLUMN_BY_CODE["owl"]),
+        _trait_score_expr(_lower_tail_score_expr(percentile_expr_by_feature["share_night_txn"]))
+        .alias(TRAIT_SCORE_COLUMN_BY_CODE["early_bird"]),
+        _trait_score_expr(_upper_tail_score_expr(percentile_expr_by_feature["share_weekend_txn"]))
+        .alias(TRAIT_SCORE_COLUMN_BY_CODE["weekend_lover"]),
+        _trait_score_expr(_upper_tail_score_expr(explorer_raw_expr)).alias(TRAIT_SCORE_COLUMN_BY_CODE["explorer"]),
+        _trait_score_expr(_upper_tail_score_expr(routine_raw_expr)).alias(TRAIT_SCORE_COLUMN_BY_CODE["routine"]),
+        _trait_score_expr(_upper_tail_score_expr(out_of_home_raw_expr))
+        .alias(TRAIT_SCORE_COLUMN_BY_CODE["out_of_home_leisure"]),
+        _trait_score_expr(
+            pl.when(traveler_signal_expr)
+            .then(_upper_tail_score_expr(traveler_raw_expr))
+            .otherwise(0.0)
+        ).alias(TRAIT_SCORE_COLUMN_BY_CODE["traveler"]),
+    )
+
+
+def _resolve_trait_conflicts(user_features_pl: pl.DataFrame) -> pl.DataFrame:
+    owl_score_expr = pl.col(TRAIT_SCORE_COLUMN_BY_CODE["owl"]).fill_null(0.0)
+    early_bird_score_expr = pl.col(TRAIT_SCORE_COLUMN_BY_CODE["early_bird"]).fill_null(0.0)
+    explorer_score_expr = pl.col(TRAIT_SCORE_COLUMN_BY_CODE["explorer"]).fill_null(0.0)
+    routine_score_expr = pl.col(TRAIT_SCORE_COLUMN_BY_CODE["routine"]).fill_null(0.0)
+
+    return user_features_pl.with_columns(
+        pl.when(owl_score_expr >= early_bird_score_expr)
+        .then(owl_score_expr)
+        .otherwise(0.0)
+        .alias(TRAIT_SCORE_COLUMN_BY_CODE["owl"]),
+        pl.when(early_bird_score_expr > owl_score_expr)
+        .then(early_bird_score_expr)
+        .otherwise(0.0)
+        .alias(TRAIT_SCORE_COLUMN_BY_CODE["early_bird"]),
+        pl.when(explorer_score_expr >= routine_score_expr)
+        .then(explorer_score_expr)
+        .otherwise(0.0)
+        .alias(TRAIT_SCORE_COLUMN_BY_CODE["explorer"]),
+        pl.when(routine_score_expr > explorer_score_expr)
+        .then(routine_score_expr)
+        .otherwise(0.0)
+        .alias(TRAIT_SCORE_COLUMN_BY_CODE["routine"]),
+    )
+
+
+def _build_trait_tag_columns(user_features_pl: pl.DataFrame) -> pl.DataFrame:
+    score_struct_expr = pl.struct([
+        pl.col(TRAIT_SCORE_COLUMN_BY_CODE[trait_code])
+        for trait_code in TRAIT_INTERNAL_CODES
+    ])
+    return user_features_pl.with_columns(
+        score_struct_expr.map_elements(
+            _build_trait_internal_tags,
+            return_dtype=pl.Utf8,
+        ).alias("trait_tags_internal"),
+        score_struct_expr.map_elements(
+            _build_trait_display_tags,
+            return_dtype=pl.Utf8,
+        ).alias("trait_tags_display"),
+    )
+
+
+def _trait_percentile_column_name(feature_name: str) -> str:
+    return f"__trait_pct_{sanitize_token(feature_name)}"
+
+
+def _sqrt_non_negative_ratio_expr(column_name: str, reference_value: float) -> pl.Expr:
+    numeric_value_expr = pl.col(column_name).fill_null(0.0).cast(pl.Float64, strict=False)
+    return (
+        pl.when(numeric_value_expr > 0.0)
+        .then((numeric_value_expr / float(reference_value)).sqrt())
+        .otherwise(0.0)
+    )
+
+
+def _build_percentile_expr(*, feature_name: str, eligible_column: str) -> pl.Expr:
+    source_expr = (
+        pl.when(pl.col(eligible_column) & pl.col(feature_name).is_not_null())
+        .then(pl.col(feature_name).cast(pl.Float64, strict=False))
+        .otherwise(None)
+    )
+    rank_expr = source_expr.rank(method="average")
+    valid_count_expr = source_expr.is_not_null().sum()
+    percentile_expr = (
+        pl.when(rank_expr.is_not_null())
+        .then(
+            pl.when(valid_count_expr > 1)
+            .then((rank_expr - 1.0) / (valid_count_expr - 1.0))
+            .otherwise(0.0)
+        )
+        .otherwise(None)
+    )
+    return (
+        pl.when(percentile_expr.is_not_null())
+        .then(_clamp_0_1_expr(percentile_expr))
+        .otherwise(None)
+        .alias(_trait_percentile_column_name(feature_name))
+    )
+
+
+def _composite_mean_expr(component_exprs: list[pl.Expr], *, min_valid_components: int) -> pl.Expr:
+    valid_count_expr = pl.sum_horizontal([
+        pl.when(component_expr.is_not_null()).then(1).otherwise(0)
+        for component_expr in component_exprs
+    ]).cast(pl.Float64)
+    value_sum_expr = pl.sum_horizontal([
+        pl.when(component_expr.is_not_null()).then(component_expr).otherwise(0.0)
+        for component_expr in component_exprs
+    ])
+    return (
+        pl.when(valid_count_expr >= float(min_valid_components))
+        .then(value_sum_expr / valid_count_expr)
+        .otherwise(None)
+    )
+
+
+def _upper_tail_score_expr(percentile_expr: pl.Expr) -> pl.Expr:
+    return _clamp_0_1_expr((percentile_expr - TRAIT_UPPER_TAIL_START) / TRAIT_TAIL_WIDTH)
+
+
+def _lower_tail_score_expr(percentile_expr: pl.Expr) -> pl.Expr:
+    return _clamp_0_1_expr((TRAIT_LOWER_TAIL_END - percentile_expr) / TRAIT_TAIL_WIDTH)
+
+
+def _trait_score_expr(base_score_expr: pl.Expr) -> pl.Expr:
+    support_weight_expr = pl.col(TRAIT_INTERNAL_SUPPORT_WEIGHT_COLUMN).fill_null(0.0)
+    return (
+        pl.when(pl.col(TRAIT_INTERNAL_ELIGIBLE_COLUMN))
+        .then(_clamp_0_1_expr(base_score_expr * support_weight_expr))
+        .otherwise(0.0)
+    )
+
+
+def _clamp_0_1_expr(value_expr: pl.Expr) -> pl.Expr:
+    return pl.min_horizontal(
+        pl.lit(1.0),
+        pl.max_horizontal(pl.lit(0.0), value_expr),
+    )
+
+
+def _build_trait_internal_tags(score_row: dict[str, object]) -> str:
+    return _serialize_trait_tags([trait_code for trait_code, _, _ in _select_top_trait_payload(score_row)])
+
+
+def _build_trait_display_tags(score_row: dict[str, object]) -> str:
+    return _serialize_trait_tags([display_tag for _, display_tag, _ in _select_top_trait_payload(score_row)])
+
+
+def _select_top_trait_payload(score_row: dict[str, object] | None) -> list[tuple[str, str, float]]:
+    if not isinstance(score_row, dict):
+        return []
+
+    selected: list[tuple[str, str, float, int]] = []
+    for order_index, trait_code in enumerate(TRAIT_INTERNAL_CODES):
+        score_column = TRAIT_SCORE_COLUMN_BY_CODE[trait_code]
+        try:
+            score_value = float(score_row.get(score_column, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            score_value = 0.0
+        if score_value < TRAIT_TAG_SCORE_THRESHOLD:
+            continue
+        selected.append((trait_code, TRAIT_DISPLAY_TAG_BY_CODE[trait_code], score_value, order_index))
+
+    selected.sort(key=lambda trait_payload: (-trait_payload[2], trait_payload[3]))
+    top_traits = selected[:TRAIT_TAG_MAX_COUNT]
+    return [
+        (trait_code, display_tag, score_value)
+        for trait_code, display_tag, score_value, _ in top_traits
+    ]
+
+
+def _serialize_trait_tags(tag_values: list[str]) -> str:
+    return json.dumps(tag_values, ensure_ascii=False, separators=(",", ":"))
+
+
 def assemble_final_dataset(
     *,
     final_parquet_path: Path = FINAL_PARQUET_PATH,
@@ -531,7 +880,10 @@ def assemble_final_dataset(
         )
     )
 
-    sink_parquet(final_parquet_path, final_lf)
+    final_df = collect_stream(final_lf)
+    final_df = add_deterministic_user_traits(final_df)
+    final_parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    final_df.write_parquet(final_parquet_path)
 
 
 def validate_final_dataset(user_features_pl: pl.DataFrame) -> None:

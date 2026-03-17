@@ -24,6 +24,8 @@ class RecommendationRuntimeConfig:
     popularity_action_weights: dict[str, float] = field(
         default_factory=lambda: dict(InteractionWeightsMapper().dict_to_map)
     )
+    uncertainty_mean_score_threshold: float = 0.0
+    uncertainty_gap_threshold: float = 0.05
     stage_23_model_dir: str = str(Paths.stage_23_model_dir)
     stage_4_model_dir: str = str(Paths.stage_4_model_dir)
 
@@ -36,6 +38,8 @@ class RecommendationRuntimeConfig:
             an_impactful_features=self.an_impactful_features,
             recommendation_stage=self.recommendation_stage.value,
             popularity_action_weights=dict(self.popularity_action_weights),
+            uncertainty_mean_score_threshold=float(self.uncertainty_mean_score_threshold),
+            uncertainty_gap_threshold=float(self.uncertainty_gap_threshold),
         )
         global_conf = GlobalConfig(
             n_max_candidates=self.n_max_candidates,

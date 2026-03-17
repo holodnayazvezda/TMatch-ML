@@ -53,6 +53,11 @@ def get_exotic_candidates(request_or_n_people, search_bundle=None):
         return pd.DataFrame()
 
     result_df = output_df.iloc[selected_indices].copy().reset_index(drop=True)
+    candidate_ids = [
+        normalize_user_id(user_ids[int(candidate_index)], allow_hash=True)
+        for candidate_index in selected_indices
+    ]
+    result_df["candidate_id"] = pd.Series(candidate_ids, index=result_df.index, dtype="string")
     impactful_feature_count = int(
         getattr(
             request_or_n_people,
@@ -73,6 +78,8 @@ def get_exotic_candidates(request_or_n_people, search_bundle=None):
         for seed_basis in seed_basis_values
     ]
     result_df.insert(0, "rank", np.arange(1, len(result_df) + 1, dtype=np.int32))
+    if "cluster_id" in result_df.columns:
+        result_df = result_df.drop(columns=["cluster_id"])
     result_df.insert(1, "cluster_id", np.asarray(selected_cluster_ids, dtype=np.int32))
     result_df.insert(2, "distance_euclidean", np.asarray(centroid_distances, dtype=float))
     result_df.insert(3, "impactful_features", impactful_features)

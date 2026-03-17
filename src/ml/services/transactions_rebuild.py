@@ -13,6 +13,7 @@ import structlog
 from core.data_config import Paths
 from ml.candidates import transactions_candidates
 from ml.featurize import transactions_features
+from ml.services.dating_profile_traits_sync import sync_dating_profile_traits
 from ml.services.offline_artifacts import build_transaction_artifacts
 
 log: structlog.BoundLogger = structlog.get_logger(__name__)
@@ -110,6 +111,20 @@ def rebuild_transactions_data_and_artifacts() -> dict[str, Any]:
             published_user_ids_csv_path=str(_PATHS.transaction_user_ids_csv_path),
         )
 
+        current_stage = "sync_dating_profile_traits"
+        stage_started_at = perf_counter()
+        traits_sync_summary = sync_dating_profile_traits(user_features_df)
+        _log_stage_finished(
+            stage=current_stage,
+            started_at=stage_started_at,
+            status=traits_sync_summary.get("status"),
+            users_in_payload=traits_sync_summary.get("users_in_payload"),
+            profiles_found=traits_sync_summary.get("profiles_found"),
+            profiles_without_row=traits_sync_summary.get("profiles_without_row"),
+            existing_traits_deleted=traits_sync_summary.get("existing_traits_deleted"),
+            inserted_traits_count=traits_sync_summary.get("inserted_traits_count"),
+        )
+
         current_stage = "rebuild_transaction_artifacts"
         stage_started_at = perf_counter()
         artifacts_summary = build_transaction_artifacts(force=True)
@@ -144,6 +159,7 @@ def rebuild_transactions_data_and_artifacts() -> dict[str, Any]:
             },
             "artifact_summary": artifacts_summary,
             "reload_status": reload_status,
+            "dating_profile_traits_sync": traits_sync_summary,
         }
         log.info("transactions_rebuild_succeeded", **summary)
         return summary

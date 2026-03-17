@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from time import perf_counter
 
+import numpy as np
 import pandas as pd
 import structlog
 
@@ -22,6 +23,9 @@ from ml.services.user_id import normalize_user_id
 log: structlog.BoundLogger = structlog.get_logger(__name__)
 _BLOCKLIST_SERVICE = InteractionBlocklistService()
 _REQUIRED_REASON_COUNT = 3
+_UNKNOWN_CLUSTER_ID = "unknown"
+_UNCERTAINTY_TOP_SCORE_COUNT = 5
+_UNCERTAINTY_TOP_POOL_SIZE = 15
 
 
 def get_recommendations_for_user(
@@ -94,7 +98,24 @@ def get_recommendations_for_user(
     )
 
     step_started = perf_counter()
-    prepared_df = _prepare_candidate_reasons(ranked_df)
+    uncertainty_adjusted_df = _apply_uncertainty_strategy(
+        candidate_df=ranked_df,
+        stage=stage,
+        actor_user_id=normalized_user_id,
+        conf=conf,
+        top_n=g_conf.n_rec_users,
+        targeting_profile_cache=targeting_profile_cache,
+    )
+    _log_step_timing(
+        user_id=normalized_user_id,
+        stage=stage,
+        step="uncertainty_strategy",
+        started_at=step_started,
+        candidate_df=uncertainty_adjusted_df,
+    )
+
+    step_started = perf_counter()
+    prepared_df = _prepare_candidate_reasons(uncertainty_adjusted_df)
     _log_step_timing(
         user_id=normalized_user_id,
         stage=stage,
@@ -243,6 +264,341 @@ def _apply_ranking_if_available(
         ascending=[False],
         na_position="last",
     ).reset_index(drop=True)
+
+
+def _apply_uncertainty_strategy(
+    *,
+    candidate_df: pd.DataFrame,
+    stage: RecommendationStage,
+    actor_user_id: str,
+    conf: RerankConfig,
+    top_n: int,
+    targeting_profile_cache: dict[str, UserTargetingProfile] | None = None,
+) -> pd.DataFrame:
+    if candidate_df.empty:
+        return candidate_df
+
+    top_k = max(int(top_n), 0)
+    if top_k <= 0:
+        return candidate_df.iloc[0:0].copy()
+
+    result = _ensure_candidate_ids(candidate_df)
+    result = result[result["candidate_id"].notna() & (result["candidate_id"] != "")].copy()
+    if result.empty:
+        return result.reset_index(drop=True)
+
+    result = _ensure_transaction_cluster_column(result)
+    base_sorted_df = _sort_candidates_for_score(result, score_column="rerank_score")
+    if stage not in {
+        RecommendationStage.STAGE_2,
+        RecommendationStage.STAGE_3,
+        RecommendationStage.STAGE_4,
+    }:
+        return base_sorted_df.reset_index(drop=True)
+
+    mean_all_score, gap_score, finite_score_count = _compute_uncertainty_metrics(base_sorted_df)
+    if mean_all_score is None or gap_score is None:
+        return base_sorted_df.reset_index(drop=True)
+
+    threshold_mean = float(getattr(conf, "uncertainty_mean_score_threshold", 0.0) or 0.0)
+    threshold_gap = float(getattr(conf, "uncertainty_gap_threshold", 0.05) or 0.05)
+    check_1 = mean_all_score > threshold_mean
+    check_2 = gap_score > threshold_gap
+
+    unknown_cluster_count = int((base_sorted_df["transaction_cluster_id"] == _UNKNOWN_CLUSTER_ID).sum())
+    log.info(
+        "recommendation_uncertainty_metrics",
+        actor_user_id=actor_user_id,
+        stage=stage.value,
+        candidate_count=int(base_sorted_df.shape[0]),
+        finite_score_count=int(finite_score_count),
+        mean_all_score=float(mean_all_score),
+        gap_score=float(gap_score),
+        uncertainty_mean_score_threshold=threshold_mean,
+        uncertainty_gap_threshold=threshold_gap,
+        check_1=bool(check_1),
+        check_2=bool(check_2),
+        unknown_cluster_count=unknown_cluster_count,
+    )
+
+    scenario = "s1"
+    if check_1 and check_2:
+        selected_df = base_sorted_df.head(top_k).reset_index(drop=True)
+    elif check_1 and not check_2:
+        scenario = "s2"
+        top_pool_df = base_sorted_df.head(_UNCERTAINTY_TOP_POOL_SIZE).copy()
+        diverse_df = _select_cluster_diverse_candidates(
+            top_pool_df,
+            top_k=top_k,
+            score_column="rerank_score",
+        )
+        selected_df = _fill_with_ordered_candidates(
+            selected_df=diverse_df,
+            ordered_df=base_sorted_df,
+            top_k=top_k,
+        )
+    elif (not check_1) and check_2:
+        scenario = "s3"
+        diverse_df = _select_cluster_diverse_candidates(
+            base_sorted_df,
+            top_k=top_k,
+            score_column="rerank_score",
+        )
+        selected_df = _fill_with_ordered_candidates(
+            selected_df=diverse_df,
+            ordered_df=base_sorted_df,
+            top_k=top_k,
+        )
+    else:
+        scenario = "s4"
+        selected_df = _build_popularity_diverse_candidates(
+            actor_user_id=actor_user_id,
+            stage=stage,
+            conf=conf,
+            top_k=top_k,
+            base_sorted_df=base_sorted_df,
+            targeting_profile_cache=targeting_profile_cache,
+        )
+
+    selected_df = _ensure_transaction_cluster_column(selected_df)
+    selected_df = selected_df.head(top_k).reset_index(drop=True)
+    log.info(
+        "recommendation_uncertainty_scenario_selected",
+        actor_user_id=actor_user_id,
+        stage=stage.value,
+        scenario=scenario,
+        pre_count=int(base_sorted_df.shape[0]),
+        post_count=int(selected_df.shape[0]),
+    )
+    return selected_df
+
+
+def _compute_uncertainty_metrics(candidate_df: pd.DataFrame) -> tuple[float | None, float | None, int]:
+    if candidate_df.empty or "rerank_score" not in candidate_df.columns:
+        return None, None, 0
+
+    score_series = pd.to_numeric(candidate_df["rerank_score"], errors="coerce")
+    score_values = score_series.to_numpy(dtype=float, copy=False)
+    finite_values = score_values[np.isfinite(score_values)]
+    finite_score_count = int(finite_values.size)
+    if finite_score_count <= 0:
+        return None, None, 0
+
+    mean_all_score = float(np.mean(finite_values))
+    sorted_scores = np.sort(finite_values)[::-1]
+    top_count = min(_UNCERTAINTY_TOP_SCORE_COUNT, finite_score_count)
+    top_mean = float(np.mean(sorted_scores[:top_count]))
+    rest_scores = sorted_scores[top_count:]
+    if rest_scores.size == 0:
+        gap_score = 0.0
+    else:
+        gap_score = float(top_mean - np.mean(rest_scores))
+
+    return mean_all_score, gap_score, finite_score_count
+
+
+def _select_cluster_diverse_candidates(
+    candidate_df: pd.DataFrame,
+    *,
+    top_k: int,
+    score_column: str = "rerank_score",
+) -> pd.DataFrame:
+    if candidate_df.empty or int(top_k) <= 0:
+        return candidate_df.iloc[0:0].copy()
+
+    normalized_df = _ensure_transaction_cluster_column(candidate_df)
+    ordered_df = _sort_candidates_for_score(normalized_df, score_column=score_column)
+    if ordered_df.empty:
+        return ordered_df
+
+    selected_positions: list[int] = []
+    selected_clusters: set[str] = set()
+    for row_position, row in ordered_df.iterrows():
+        cluster_id = _normalize_cluster_id(row.get("transaction_cluster_id"))
+        if cluster_id in selected_clusters:
+            continue
+        selected_positions.append(int(row_position))
+        selected_clusters.add(cluster_id)
+        if len(selected_positions) >= int(top_k):
+            break
+
+    selected_df = ordered_df.loc[selected_positions].copy() if selected_positions else ordered_df.iloc[0:0].copy()
+    return _fill_with_ordered_candidates(
+        selected_df=selected_df,
+        ordered_df=ordered_df,
+        top_k=int(top_k),
+    )
+
+
+def _build_popularity_diverse_candidates(
+    *,
+    actor_user_id: str,
+    stage: RecommendationStage,
+    conf: RerankConfig,
+    top_k: int,
+    base_sorted_df: pd.DataFrame,
+    targeting_profile_cache: dict[str, UserTargetingProfile] | None = None,
+) -> pd.DataFrame:
+    from ml.candidates import popularity_fallback
+
+    fallback_conf = _build_fallback_conf(conf, top_n=top_k)
+    popularity_df = _safe_fetch(popularity_fallback.get_popular_candidates, fallback_conf)
+    fetched_count = int(popularity_df.shape[0])
+    if popularity_df.empty:
+        return _fill_with_ordered_candidates(
+            selected_df=popularity_df,
+            ordered_df=base_sorted_df,
+            top_k=top_k,
+        )
+
+    popularity_df = attach_feature_snapshots(popularity_df, actor_user_id=actor_user_id, stage=stage)
+    popularity_df = _apply_hard_filters(
+        popularity_df,
+        actor_user_id=actor_user_id,
+        targeting_profile_cache=targeting_profile_cache,
+    )
+    filtered_count = int(popularity_df.shape[0])
+    popularity_df = _ensure_transaction_cluster_column(popularity_df)
+    popularity_ordered_df = _sort_candidates_for_score(popularity_df, score_column="popularity_score")
+    popularity_diverse_df = _select_cluster_diverse_candidates(
+        popularity_ordered_df,
+        top_k=top_k,
+        score_column="popularity_score",
+    )
+    diversity_count = int(popularity_diverse_df.shape[0])
+    selected_df = _fill_with_ordered_candidates(
+        selected_df=popularity_diverse_df,
+        ordered_df=popularity_ordered_df,
+        top_k=top_k,
+    )
+    filled_from_popularity_count = int(selected_df.shape[0])
+
+    if int(selected_df.shape[0]) < int(top_k):
+        selected_df = _fill_with_ordered_candidates(
+            selected_df=selected_df,
+            ordered_df=base_sorted_df,
+            top_k=top_k,
+        )
+    total_count = int(selected_df.shape[0])
+    log.info(
+        "recommendation_uncertainty_s4_popularity_applied",
+        actor_user_id=actor_user_id,
+        stage=stage.value,
+        fetched_count=fetched_count,
+        filtered_count=filtered_count,
+        diversity_count=diversity_count,
+        filled_from_popularity_count=filled_from_popularity_count,
+        total_count=total_count,
+    )
+
+    return selected_df.reset_index(drop=True)
+
+
+def _fill_with_ordered_candidates(
+    *,
+    selected_df: pd.DataFrame,
+    ordered_df: pd.DataFrame,
+    top_k: int,
+) -> pd.DataFrame:
+    if int(top_k) <= 0:
+        return ordered_df.iloc[0:0].copy()
+
+    selected = _ensure_candidate_ids(selected_df) if not selected_df.empty else selected_df.copy()
+    ordered = _ensure_candidate_ids(ordered_df) if not ordered_df.empty else ordered_df.copy()
+    if ordered.empty:
+        return selected.head(int(top_k)).reset_index(drop=True)
+
+    if selected.empty:
+        return ordered.head(int(top_k)).reset_index(drop=True)
+
+    selected_candidate_ids = set(selected["candidate_id"].dropna().astype("string").tolist())
+    remaining_df = ordered[~ordered["candidate_id"].astype("string").isin(selected_candidate_ids)].copy()
+    required_count = max(int(top_k) - int(selected.shape[0]), 0)
+    if required_count > 0:
+        selected = pd.concat([selected, remaining_df.head(required_count)], ignore_index=True)
+    return selected.head(int(top_k)).reset_index(drop=True)
+
+
+def _sort_candidates_for_score(candidate_df: pd.DataFrame, *, score_column: str) -> pd.DataFrame:
+    if candidate_df.empty:
+        return candidate_df
+
+    result = _ensure_candidate_ids(candidate_df)
+    result = result[result["candidate_id"].notna() & (result["candidate_id"] != "")].copy()
+    if result.empty:
+        return result.reset_index(drop=True)
+
+    sort_columns: list[str] = []
+    ascending: list[bool] = []
+
+    if score_column in result.columns:
+        result["_sort_score"] = pd.to_numeric(result[score_column], errors="coerce")
+        sort_columns.append("_sort_score")
+        ascending.append(False)
+    if "rank" in result.columns:
+        result["_sort_rank"] = pd.to_numeric(result["rank"], errors="coerce")
+        sort_columns.append("_sort_rank")
+        ascending.append(True)
+    result["_sort_candidate_id"] = result["candidate_id"].astype("string")
+    sort_columns.append("_sort_candidate_id")
+    ascending.append(True)
+
+    result = result.sort_values(
+        sort_columns,
+        ascending=ascending,
+        na_position="last",
+        kind="mergesort",
+    ).reset_index(drop=True)
+    return result.drop(columns=["_sort_score", "_sort_rank", "_sort_candidate_id"], errors="ignore")
+
+
+def _ensure_transaction_cluster_column(candidate_df: pd.DataFrame) -> pd.DataFrame:
+    result = _ensure_candidate_ids(candidate_df)
+    if result.empty:
+        return result
+
+    if "transaction_cluster_id" not in result.columns:
+        result["transaction_cluster_id"] = pd.Series(pd.NA, index=result.index, dtype="string")
+        cluster_lookup: dict[str, str] = {}
+        candidate_ids = result["candidate_id"].dropna().astype("string").tolist()
+        if candidate_ids:
+            from ml.candidates import transactions_candidates
+
+            try:
+                cluster_lookup = transactions_candidates.get_transaction_cluster_ids(
+                    candidate_ids,
+                    unknown_cluster_id=_UNKNOWN_CLUSTER_ID,
+                )
+            except Exception:
+                cluster_lookup = {}
+        result["transaction_cluster_id"] = result["candidate_id"].map(
+            lambda candidate_id: cluster_lookup.get(str(candidate_id), _UNKNOWN_CLUSTER_ID)
+        )
+    else:
+        result["transaction_cluster_id"] = result["transaction_cluster_id"].astype("string")
+
+    result["transaction_cluster_id"] = (
+        result["transaction_cluster_id"]
+        .map(_normalize_cluster_id)
+        .astype("string")
+    )
+    return result
+
+
+def _normalize_cluster_id(raw_cluster_id: object) -> str:
+    if raw_cluster_id is None:
+        return _UNKNOWN_CLUSTER_ID
+    try:
+        if pd.isna(raw_cluster_id):
+            return _UNKNOWN_CLUSTER_ID
+    except TypeError:
+        pass
+    if isinstance(raw_cluster_id, float) and pd.isna(raw_cluster_id):
+        return _UNKNOWN_CLUSTER_ID
+    cluster_text = str(raw_cluster_id).strip()
+    if not cluster_text or cluster_text.lower() in {"nan", "none", "<na>"}:
+        return _UNKNOWN_CLUSTER_ID
+    return cluster_text
 
 
 def _apply_hard_filters(
