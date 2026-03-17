@@ -491,15 +491,14 @@ def _return_top_n(
         deduped_df["already_shown"] = False
 
     fresh_df = deduped_df[~deduped_df["already_shown"]].copy()
-    shown_df = deduped_df[deduped_df["already_shown"]].copy()
-    result_df = pd.concat([fresh_df, shown_df], ignore_index=True).head(int(top_n)).reset_index(drop=True)
-
-    recycled_count = int(result_df.get("already_shown", pd.Series(dtype=bool)).sum())
-    if recycled_count > 0 and int(fresh_df.shape[0]) < int(top_n):
+    result_df = fresh_df.head(int(top_n)).reset_index(drop=True)
+    if int(result_df.shape[0]) < int(top_n):
         log.info(
-            "recommendation_recycled_shown_candidates",
+            "recommendation_fresh_candidates_exhausted",
             actor_user_id=actor_user_id,
-            recycled_count=recycled_count,
+            requested_count=int(top_n),
+            available_fresh_count=int(result_df.shape[0]),
+            total_candidate_count=int(deduped_df.shape[0]),
         )
     return result_df
 

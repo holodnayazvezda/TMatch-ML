@@ -14,6 +14,6 @@ def health() -> dict[str, str]:
 @router.get("/health/ready")
 def health_ready() -> JSONResponse:
     payload = get_artifact_readiness_payload()
-    if payload["ready"]:
+    if payload["launch_ready"]:
         return JSONResponse(status_code=200, content=payload)
     return JSONResponse(status_code=503, content=payload)

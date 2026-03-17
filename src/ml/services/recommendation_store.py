@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from ml.infra.db.init_db import init_db
 from ml.infra.db.models import (
     Interaction,
+    MLRecommendationCycleState,
     MLRecommendationGroup,
     MLRecommendationImpression,
 )
@@ -462,10 +463,59 @@ def get_train_rows(
         ]
 
 
+def reset_recommendation_cycle(
+    actor_user_id: str,
+    *,
+    reset_at: datetime | None = None,
+) -> datetime:
+    init_db()
+    with SessionLocal() as session:
+        with session.begin():
+            return reset_recommendation_cycle_in_session(
+                session,
+                actor_user_id=actor_user_id,
+                reset_at=reset_at,
+            )
+
+
+def reset_recommendation_cycle_in_session(
+    session: Session,
+    *,
+    actor_user_id: str,
+    reset_at: datetime | None = None,
+) -> datetime:
+    normalized_actor_user_id = _normalize_required_user_id(
+        actor_user_id,
+        field_name="actor_user_id",
+    )
+    cycle_started_at = _to_aware_utc(reset_at or datetime.now(timezone.utc))
+    if cycle_started_at is None:
+        raise ValueError("reset_at must be a valid datetime")
+
+    cycle_state_table = MLRecommendationCycleState.__table__
+    session.execute(
+        pg_insert(cycle_state_table)
+        .values(
+            {
+                "actor_user_id": normalized_actor_user_id,
+                "cycle_started_at": cycle_started_at,
+            }
+        )
+        .on_conflict_do_update(
+            index_elements=[cycle_state_table.c.actor_user_id],
+            set_={
+                "cycle_started_at": pg_insert(cycle_state_table).excluded.cycle_started_at,
+            },
+        )
+    )
+    return cycle_started_at
+
+
 def get_shown_candidate_ids(
     actor_user_id: str,
     *,
     candidate_user_ids: Sequence[str] | None = None,
+    session: Session | None = None,
 ) -> set[str]:
     init_db()
 
@@ -474,14 +524,40 @@ def get_shown_candidate_ids(
         field_name="actor_user_id",
     )
     normalized_candidate_ids = _normalize_non_empty_user_ids(candidate_user_ids or [])
-    stmt = select(MLRecommendationImpression.candidate_user_id).where(
-        MLRecommendationImpression.actor_user_id == normalized_actor_user_id,
-    )
-    if normalized_candidate_ids:
-        stmt = stmt.where(MLRecommendationImpression.candidate_user_id.in_(normalized_candidate_ids))
 
-    with SessionLocal() as session:
-        return set(session.execute(stmt).scalars().all())
+    def _collect_shown_ids(local_session: Session) -> set[str]:
+        cycle_started_at = _get_cycle_started_at_in_session(
+            local_session,
+            actor_user_id=normalized_actor_user_id,
+        )
+        stmt = select(MLRecommendationImpression.candidate_user_id).where(
+            MLRecommendationImpression.actor_user_id == normalized_actor_user_id,
+        )
+        if cycle_started_at is not None:
+            stmt = stmt.where(MLRecommendationImpression.shown_at >= cycle_started_at)
+        if normalized_candidate_ids:
+            stmt = stmt.where(MLRecommendationImpression.candidate_user_id.in_(normalized_candidate_ids))
+        return set(local_session.execute(stmt).scalars().all())
+
+    if session is not None:
+        return _collect_shown_ids(session)
+
+    with SessionLocal() as local_session:
+        return _collect_shown_ids(local_session)
+
+
+def _get_cycle_started_at_in_session(
+    session: Session,
+    *,
+    actor_user_id: str,
+) -> datetime | None:
+    stmt = (
+        select(MLRecommendationCycleState.cycle_started_at)
+        .where(MLRecommendationCycleState.actor_user_id == actor_user_id)
+        .limit(1)
+    )
+    cycle_started_at = session.execute(stmt).scalar_one_or_none()
+    return _to_aware_utc(cycle_started_at)
 
 
 def _list_pending_group_ids_for_user_in_session(session: Session, actor_user_id: str) -> list[str]:

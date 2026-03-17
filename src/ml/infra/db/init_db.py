@@ -25,6 +25,7 @@ def init_db(force: bool = False) -> None:
             interaction_feature_tables.user_interaction_features_table,
             models.MLRecommendationGroup.__table__,
             models.MLRecommendationImpression.__table__,
+            models.MLRecommendationCycleState.__table__,
             models.MLRecommendationSample.__table__,
         )
         for table in managed_tables:
@@ -36,6 +37,7 @@ def init_db(force: bool = False) -> None:
                 ("ml_recommendation_groups", "actor_user_id"),
                 ("ml_recommendation_impressions", "actor_user_id"),
                 ("ml_recommendation_impressions", "candidate_user_id"),
+                ("ml_recommendation_cycle_state", "actor_user_id"),
                 ("ml_recommendation_samples", "user_id"),
                 ("ml_recommendation_samples", "candidate_user_id"),
             ):
@@ -102,6 +104,14 @@ def init_db(force: bool = False) -> None:
                     """
                     CREATE INDEX IF NOT EXISTS ix_ml_recommendation_groups_shown_at
                     ON ml_recommendation_groups (shown_at)
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_ml_recommendation_cycle_state_started_at
+                    ON ml_recommendation_cycle_state (cycle_started_at)
                     """
                 )
             )

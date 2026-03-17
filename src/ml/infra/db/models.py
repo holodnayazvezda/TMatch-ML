@@ -86,6 +86,16 @@ class MLRecommendationImpression(Base):
     source_row_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
 
 
+class MLRecommendationCycleState(Base):
+    __tablename__ = "ml_recommendation_cycle_state"
+    __table_args__ = (
+        Index("ix_ml_recommendation_cycle_state_started_at", "cycle_started_at"),
+    )
+
+    actor_user_id: Mapped[str] = mapped_column(PG_UUID(as_uuid=False), primary_key=True)
+    cycle_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class MLRecommendationSample(Base):
     __tablename__ = "ml_recommendation_samples"
     __table_args__ = (

@@ -13,6 +13,8 @@ from ml.services.recommendation_runtime_config import (
 )
 from ml.services.recommendation_serving import get_recommendations_for_user
 from ml.services.recommendation_store import (
+    get_shown_candidate_ids,
+    reset_recommendation_cycle,
     run_with_user_recommendation_lock,
     save_recommendation_group_in_session,
 )
@@ -55,6 +57,22 @@ def _generate_recommendations_response(raw_user_id: str) -> list[dict[str, objec
             conf=conf,
             g_conf=g_conf,
         )
+        if result_df.empty:
+            shown_candidate_ids = get_shown_candidate_ids(normalized_user_id)
+            if shown_candidate_ids:
+                cycle_started_at = reset_recommendation_cycle(normalized_user_id)
+                log.info(
+                    "recommendation_cycle_reset",
+                    actor_user_id=normalized_user_id,
+                    cycle_started_at=cycle_started_at.isoformat(),
+                )
+                result_df = get_recommendations_for_user(
+                    user_id=normalized_user_id,
+                    runtime_config=DEFAULT_RECOMMENDATION_RUNTIME_CONFIG,
+                    conf=conf,
+                    g_conf=g_conf,
+                )
+
         recommendation_id = generate_recommendation_id()
         shown_at = datetime.now(timezone.utc)
 
