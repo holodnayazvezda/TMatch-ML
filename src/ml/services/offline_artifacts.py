@@ -13,7 +13,7 @@ import faiss
 import numpy as np
 import pandas as pd
 import structlog
-from sqlalchemy import case, func, select
+from sqlalchemy import String, case, cast, func, select
 
 from core.data_config import InteractionWeightsMapper, Paths
 from ml.candidates import transactions_candidates
@@ -145,10 +145,11 @@ def build_popularity_snapshot(*, force: bool = False, max_candidates: int = 200_
         str(action).strip().lower(): float(weight)
         for action, weight in dict(InteractionWeightsMapper().dict_to_map).items()
     }
+    normalized_action_expression = func.lower(func.trim(cast(Interaction.action, String)))
     action_weight_expression = case(
         *(
             (
-                func.lower(func.trim(Interaction.action)) == action,
+                normalized_action_expression == action,
                 float(weight),
             )
             for action, weight in action_weights.items()
